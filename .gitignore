@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+build/
+dist/
+*.js
+*.js.map
+*.d.ts
+!src/**/*.d.ts
+.workerShim.mjs
+
+# Environment & secrets
+.env
+.env.local
+.env.production
+
+# Bitcoin data
+bitcoin-data/
+regtest-data/
+
+# IDE & OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+.claude/

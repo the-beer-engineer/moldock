@@ -1,0 +1,32 @@
+{
+  "name": "@moldock/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "run": "tsx src/run.ts",
+    "run:fast": "tsx src/run.ts --fast",
+    "run:scale": "tsx src/run.ts --molecules=500 --atoms=3 --receptor=3 --fast",
+    "test": "tsx src/test.ts",
+    "test:regtest": "tsx src/testRegtest.ts",
+    "test:chain": "tsx src/testChainRegtest.ts",
+    "test:genesis": "tsx src/testGenesisRegtest.ts",
+    "generate": "tsx src/generate.ts",
+    "serve": "tsx src/server.ts",
+    "fetch-molecules": "tsx src/realMolecules.ts",
+    "verify": "tsx src/verifier.ts",
+    "agent": "tsx src/agentClient.ts",
+    "agent:connect": "tsx src/agentClient.ts --server",
+    "build:agent": "bash scripts/build-binary.sh"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^1.10.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  }
+}

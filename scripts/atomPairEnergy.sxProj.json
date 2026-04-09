@@ -1,0 +1,42 @@
+{
+  "name": "atomPairEnergy",
+  "root": {
+    "type": "directory",
+    "name": "root",
+    "path": "/",
+    "createdAt": "2026-04-08T00:00:00.000Z",
+    "children": [
+      {
+        "type": "file",
+        "name": "atomPairEnergy.sx",
+        "path": "/atomPairEnergy.sx",
+        "data": "import 'std.sxLib'\n\n// Atom Pair Energy Verification for Molecular Docking\n//\n// Verifies a single ligand-receptor atom pair interaction:\n//   1. Squared distance from baked-in coordinates\n//   2. Integer sqrt hint (dist^2 <= dsq < (dist+1)^2)\n//   3. Energy terms sum correctly (vdw + elec + hbond == pairTotal)\n//   4. Agent signature authorization\n//\n// All numeric values are fixed-point integers.\n// Coordinates scaled x100 (1.23 A = 123). Energies scaled x1000.\n\n// === scriptSig (agent provides at spend time) ===\n.sig @cs:1n\n.pairTotal .hbondN .elecN .vdwN\n.distN\n\n|\n\n// === scriptPubKey (baked at UTXO creation) ===\n// Coordinates interleaved for stack-efficient subtraction\n.lxN .rxN .lyN .ryN .lzN .rzN\n// Atom type/charge identifiers (binding, reserved for future formula checks)\n.typeLN .typeRN .chargeLN .chargeRN\n// Agent public key\n.pubKey\n\n// ---------------------------------------------------------------\n// Save pubKey for final checkSig\ntoAltStack\n\n// Drop atom properties (type and charge reserved for future use)\n2drop 2drop\n\n// Stack (top to bottom):\n//   rzN, lzN, ryN, lyN, rxN, lxN | distN, vdwN, elecN, hbondN, pairTotal, sig\n\n// === Phase 1: Compute dsq = dx^2 + dy^2 + dz^2 ===\n\nsub toAltStack        // dz = lzN - rzN, save to alt\nsub toAltStack        // dy = lyN - ryN, save to alt\nsub                   // dx = lxN - rxN\n\ndup mul               // dx^2\nfromAltStack dup mul add   // dx^2 + dy^2\nfromAltStack dup mul add   // dsq = dx^2 + dy^2 + dz^2\n\n// Stack: dsq, distN, vdwN, elecN, hbondN, pairTotal, sig\n\n// === Phase 2: Verify isqrt hint ===\n// Check: dist^2 <= dsq < (dist+1)^2\n\nswap dup              // dist, dist, dsq, ...\ndup mul               // dist^2, dist, dsq, ...\n2n pick               // dsq, dist^2, dist, dsq, ...\nlessThanOrEqual       // (dist^2 <= dsq), dist, dsq, ...\nverify                // dist, dsq, ...\n\n1n add dup mul        // (dist+1)^2, dsq, ...\nlessThan              // (dsq < (dist+1)^2), ...\nverify                // vdwN, elecN, hbondN, pairTotal, sig\n\n// === Phase 3: Verify energy sum ===\n// vdw + elec + hbond == pairTotal\n\nadd add               // (vdw+elec+hbond), pairTotal, sig\nequalVerify           // sig\n\n// === Phase 4: Signature verification ===\n\nfromAltStack          // pubKey, sig\ncodeSeparator\ncheckSig\n",
+        "createdAt": "2026-04-08T00:00:00.000Z",
+        "extension": "sx",
+        "id": 0
+      },
+      {
+        "type": "file",
+        "name": "sim.json",
+        "path": "/sim.json",
+        "data": "[\n  {\n    \"name\": \"createAtomPairUTXO\",\n    \"vouts\": [\n      {\n        \"type\": \"atomPairEnergy\",\n        \"sats\": 1,\n        \"args\": {\n          \"lxN\": 300,\n          \"rxN\": 100,\n          \"lyN\": 400,\n          \"ryN\": 100,\n          \"lzN\": 500,\n          \"rzN\": 200,\n          \"typeLN\": 6,\n          \"typeRN\": 7,\n          \"chargeLN\": 100,\n          \"chargeRN\": -50,\n          \"pubKey\": 0\n        }\n      }\n    ]\n  },\n  {\n    \"name\": \"verifyEnergy_pass\",\n    \"debug\": 1,\n    \"vins\": [\n      {\n        \"tx\": 0,\n        \"vout\": 0,\n        \"args\": {\n          \"distN\": 469,\n          \"vdwN\": 50,\n          \"elecN\": 30,\n          \"hbondN\": 20,\n          \"pairTotal\": 100\n        }\n      }\n    ],\n    \"vouts\": [\n      {\n        \"type\": \"p2pkh\",\n        \"args\": {\n          \"pubKeyHash\": 0\n        }\n      }\n    ]\n  }\n]",
+        "createdAt": "2026-04-08T00:00:00.000Z",
+        "extension": "json",
+        "id": 1
+      },
+      {
+        "type": "file",
+        "name": "std.sxLib",
+        "path": "/std.sxLib",
+        "data": "/* SX Standard Library */\n\n// Standard Pay-to-Public-Key-Hash\n#p2pkh\n    dup hash160 .pubKeyHash equalVerify checkSig\nend\n\n// Any-S 'PushTx' ScriptContext Verification (hat-tip @ Brendan Lee)\n#signCtx\n    toAltStack hash256\n    repeat 31n true split end\n    repeat 31n swap cat end\n    00 cat bin2num 0n 1f num2bin 1n cat add \n    414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff00 @label:curveOrder\n    tuck 2n div over lessThan\n    if\n        over mod over 2n div over lessThan\n        if sub else\n        nip endif\n        else nip\n    endif\n    repeat 31n dup 0notEqual split end\n    repeat 31n swap cat end\n    size swap cat\n    022079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179802 @label:derHeader\n    swap cat size swap cat 30 @label:sigLen\n    swap cat\n    fromAltStack // retrieve sighashType\n    cat 02b405d7f0322a89d0f9f3a98e6f938fdc1c969a8d1382a2bf66a71ae74a1e83b0\nend\n\n// Checks signed CTX\n#checkCtx\n    signCtx checkSig\nend\n\n// Verifies CTX\n#verifyCtx\n    checkCtx verify\nend\n\n// Takes copies and replaces the top alt stack item\n#copyTopAlt fromAltStack dup toAltStack end\n\n// Performs N % 2\n#mod2 2n mod end\n\n// Splits CTX with scriptCode inclusive of 'fd'\n#splitCtx\n    4n split @l:ctx.txVersion 32n split @l:ctx.hashPrevouts 32n split @l:ctx.hashSequence 36n split @l:ctx.outpoint 1n split @l:ctx.headerByte\n    swap dup fd equal if drop 2n split swap else 00 cat endif\n    bin2num split @l:ctx.scriptCode 8n split @l:ctx.value 4n split @l:ctx.nSequence 32n split @l:ctx.hashOutputs 4n split @l:ctx.nLockTime\nend\n\n// Convert number to little-endian-unsigned\n#toLEU\n    1add num2bin size 1sub split drop // Requires int n, int l on stack\nend\n// Optimized version using ternary-like conditional logic\n#writeVarInt\n    size                        //Get length of data\n    dup                         //Duplicate for comparisons\n    //Build the header using nested conditionals\n    253n lessThan            //len < 253?\n    if\n        //Single byte case\n        1n toLEU                //Convert to 1-byte LE\n    else\n        dup 65536n lessThan      //len < 65536?\n        if\n            //2-byte case with 0xfd prefix\n            0xfd swap\n            2n\n        else\n            4294967296n lessThan //len < 4294967296?\n            if\n                //4-byte case with 0xfe prefix\n                0xfe swap\n                4n\n            else\n                //8-byte case with 0xff prefix\n                0xff swap\n                8n\n            endif\n        endif\n        toLEU cat\n    endif\n    //Concatenate header with original data\n    swap cat\nend\n\n#writeVarData\n    size dup 0notEqual if\n        dup\n        4b lessThanOrEqual if\n            // small push, use raw push\n            // no opcode needed\n        else\n            dup\n            255n lessThanOrEqual if\n                4c swap 1n // OP_PUSHDATA1\n            else\n                dup\n                65535n lessThanOrEqual if\n                    4d swap 2n // OP_PUSHDATA2\n                else\n                    4e swap 4n // OP_PUSHDATA4\n                endIf\n            endIf\n            num2bin cat\n        endIf\n        swap cat // move size/prefix in front of data\n    else\n        2drop 00\n    endIf\nend\n\n#testNops\n    repeat 3n nop end\nend\n\n#verSizeCatArg // Should we add an equalVerify into this???\n    swap size rot equal if size swap cat else drop 00 endIf cat\nend\n",
+        "createdAt": "2026-04-08T00:00:00.000Z",
+        "extension": "sxLib",
+        "id": 2
+      }
+    ],
+    "isEmpty": false,
+    "id": -1
+  },
+  "simFileId": 1,
+  "version": "1.0.0"
+}

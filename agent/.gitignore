@@ -1,0 +1,8 @@
+node_modules/
+build/
+dist/
+*.js
+*.js.map
+*.d.ts
+!src/**/*.d.ts
+.workerShim.mjs

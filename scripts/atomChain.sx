@@ -1,0 +1,114 @@
+import 'std.sxLib'
+
+// Atom Chain — Covenant chain for molecular docking scoring
+//
+// Fixed 3-atom version. Each TX processes 3 ligand atoms vs one receptor atom,
+// accumulates the running score, and produces a continuation UTXO.
+//
+// State: scoreInN embedded as pushdata before OP_DROP in scriptPubKey.
+// Uses covenant_pushcodedata_codesep pattern.
+
+#chainBody
+    // Stack at entry (top first):
+    //   bodyHex,
+    //   [5 values per atom × 3 atoms = 15 values],
+    //   scoreOutN, batchTotal, inputSats, prevTxid
+
+    toAltStack      // bodyHex → alt
+
+    // === Batch pair verification (fixed 3 atoms) ===
+    0n              // accumulator = 0
+
+    repeat 3n pairVerify end
+
+    // Stack: acc, scoreOutN, batchTotal, inputSats, prevTxid
+    // Alt: bodyHex
+
+    // Verify accumulated energy == batchTotal
+    rot                 // batchTotal, acc, scoreOutN, inputSats, prevTxid
+    swap equalVerify    // scoreOutN, inputSats, prevTxid
+
+    // Save scoreOutN for hashOutputs
+    toAltStack          // inputSats, prevTxid
+    // Alt: scoreOutN, bodyHex
+
+    dup toAltStack      // save inputSats copy
+    // Alt: inputSats_copy, scoreOutN, bodyHex
+
+    swap dup            // prevTxid, prevTxid, inputSats
+
+    // F1+2: nVersion || hashPrevouts
+    00000000 cat hash256
+    02000000 swap cat
+    // F3: hashSequence
+    ffffffff hash256 cat
+    // F4: outpoint
+    swap 00000000 cat cat
+    // F5: scriptCode = 01ac
+    01ac cat
+    // F6: value
+    swap cat
+    // F7: nSequence
+    ffffffff cat
+
+    // === F8: hashOutputs ===
+    fromAltStack        // inputSats_copy
+    fromAltStack        // scoreOutN
+    fromAltStack        // bodyHex
+
+    // Build covenant code: 4d || size_2LE || bodyHex || bodyHex || abac
+    dup
+    size 2n num2bin
+    4d swap cat
+    swap cat
+    swap cat
+    abac cat            // covenantCode
+
+    // Build score pushdata: size||scoreOutN||OP_DROP
+    swap                // covenantCode, scoreOutN
+    size swap cat       // covenantCode, size||scoreOutN
+    75 cat              // covenantCode, size||scoreOutN||75
+    swap cat            // fullScript
+
+    // hashOutputs = hash256(outputValue || writeVarInt(outputScript))
+    writeVarInt
+    cat
+    hash256 cat
+
+    // F9+10
+    00000000 cat
+    41000000 cat
+
+    // Sign
+    41 signCtx
+end
+
+#pairVerify
+  toAltStack
+  swap dup
+  dup mul
+  2n pick
+  lessThanOrEqual verify
+  1n add dup mul
+  lessThan verify
+  add add
+  fromAltStack add
+end
+
+// === scriptSig ===
+.prevTxid .inputSats
+.batchTotal .scoreOutN
+.hbondN1 .elecN1 .vdwN1 .distN1 .dsqN1
+.hbondN2 .elecN2 .vdwN2 .distN2 .dsqN2
+.hbondN3 .elecN3 .vdwN3 .distN3 .dsqN3
+
+|
+
+// === scriptPubKey ===
+.scoreInN
+drop
+
+pushCodeData chainBody
+chainBody
+codeSeparator
+checkSig

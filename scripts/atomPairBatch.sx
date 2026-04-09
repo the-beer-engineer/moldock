@@ -1,0 +1,68 @@
+import 'std.sxLib'
+
+// Atom Pair Batch Verification for Molecular Docking
+//
+// Verifies N ligand atoms against one receptor atom in a single TX.
+// Per atom: verifies isqrt hint (dist^2 <= dsq < (dist+1)^2)
+// Accumulates pair energies and verifies batchTotal.
+//
+// The agent pre-computes dsq from coordinates off-chain.
+// Ligand coordinates are baked in the covenant's scriptPubKey for
+// UTXO binding (preimage enforcement). Not used in this batch script
+// directly -- the covenant wrapper handles coordinate commitment.
+//
+// All values are fixed-point integers.
+
+// === scriptSig (agent provides at spend time) ===
+.sig
+.batchTotal
+repeat .numAtomsN
+  .hbondN .elecN .vdwN .distN .dsqN
+end
+
+|
+
+// === scriptPubKey (baked at UTXO creation) ===
+.numAtomsN .pubKey
+
+// Save pubKey for final checkSig
+toAltStack
+
+// Drop numAtomsN (consumed by repeat expansion, not needed on stack)
+drop
+
+// Push accumulator = 0
+0n
+
+// === Verify each atom pair and accumulate energy ===
+repeat .numAtomsN pairVerify end
+
+// Stack: acc, batchTotal, sig
+// Verify accumulated energy equals claimed batchTotal
+equalVerify
+
+// Signature verification
+fromAltStack
+checkSig
+
+#pairVerify
+  // Stack: acc, dsqN{i}, distN{i}, vdwN{i}, elecN{i}, hbondN{i}, ..., batchTotal, sig
+  // Alt: pubKey
+  toAltStack  // save acc to alt
+
+  // === isqrt verify: dist^2 <= dsq < (dist+1)^2 ===
+  swap dup              // dist, dist, dsq, vdw, elec, hbond, ...
+  dup mul               // dist^2, dist, dsq, ...
+  2n pick               // dsq, dist^2, dist, dsq, ...
+  lessThanOrEqual       // (dist^2 <= dsq), dist, dsq, ...
+  verify                // dist, dsq, ...
+
+  1n add dup mul        // (dist+1)^2, dsq, ...
+  lessThan              // (dsq < (dist+1)^2), ...
+  verify                // vdw, elec, hbond, ...
+
+  // === Accumulate energy ===
+  // vdw + elec + hbond = pair energy for this atom
+  add add               // pair_energy, ...
+  fromAltStack add      // new_acc = old_acc + pair_energy
+end

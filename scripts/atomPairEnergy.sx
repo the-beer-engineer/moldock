@@ -1,0 +1,74 @@
+import 'std.sxLib'
+
+// Atom Pair Energy Verification for Molecular Docking
+//
+// Verifies a single ligand-receptor atom pair interaction:
+//   1. Squared distance from baked-in coordinates
+//   2. Integer sqrt hint (dist^2 <= dsq < (dist+1)^2)
+//   3. Energy terms sum correctly (vdw + elec + hbond == pairTotal)
+//   4. Agent signature authorization
+//
+// All numeric values are fixed-point integers.
+// Coordinates scaled x100 (1.23 A = 123). Energies scaled x1000.
+
+// === scriptSig (agent provides at spend time) ===
+.sig @cs:1n
+.pairTotal .hbondN .elecN .vdwN
+.distN
+
+|
+
+// === scriptPubKey (baked at UTXO creation) ===
+// Coordinates interleaved for stack-efficient subtraction
+.lxN .rxN .lyN .ryN .lzN .rzN
+// Atom type/charge identifiers (binding, reserved for future formula checks)
+.typeLN .typeRN .chargeLN .chargeRN
+// Agent public key
+.pubKey
+
+// ---------------------------------------------------------------
+// Save pubKey for final checkSig
+toAltStack
+
+// Drop atom properties (type and charge reserved for future use)
+2drop 2drop
+
+// Stack (top to bottom):
+//   rzN, lzN, ryN, lyN, rxN, lxN | distN, vdwN, elecN, hbondN, pairTotal, sig
+
+// === Phase 1: Compute dsq = dx^2 + dy^2 + dz^2 ===
+
+sub toAltStack        // dz = lzN - rzN, save to alt
+sub toAltStack        // dy = lyN - ryN, save to alt
+sub                   // dx = lxN - rxN
+
+dup mul               // dx^2
+fromAltStack dup mul add   // dx^2 + dy^2
+fromAltStack dup mul add   // dsq = dx^2 + dy^2 + dz^2
+
+// Stack: dsq, distN, vdwN, elecN, hbondN, pairTotal, sig
+
+// === Phase 2: Verify isqrt hint ===
+// Check: dist^2 <= dsq < (dist+1)^2
+
+swap dup              // dist, dist, dsq, ...
+dup mul               // dist^2, dist, dsq, ...
+2n pick               // dsq, dist^2, dist, dsq, ...
+lessThanOrEqual       // (dist^2 <= dsq), dist, dsq, ...
+verify                // dist, dsq, ...
+
+1n add dup mul        // (dist+1)^2, dsq, ...
+lessThan              // (dsq < (dist+1)^2), ...
+verify                // vdwN, elecN, hbondN, pairTotal, sig
+
+// === Phase 3: Verify energy sum ===
+// vdw + elec + hbond == pairTotal
+
+add add               // (vdw+elec+hbond), pairTotal, sig
+equalVerify           // sig
+
+// === Phase 4: Signature verification ===
+
+fromAltStack          // pubKey, sig
+codeSeparator
+checkSig
