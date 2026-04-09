@@ -1,10 +1,39 @@
 import { Transaction, P2PKH, Script, LockingScript, SatoshisPerKilobyte } from '@bsv/sdk';
 import { Wallet } from './wallet.js';
+import type { UTXO } from './wallet.js';
 import * as regtest from './regtest.js';
 import { generateChainSx } from './chainTemplate.js';
 import { compileSxToLockHex, buildChainLockScript } from './genesis.js';
 import { computeBatchEnergy } from './energy.js';
+import { config } from './config.js';
 import type { Molecule, ReceptorSite, ChainState, BatchResult } from './types.js';
+
+/** Fee UTXO for covering chain TX mining fees */
+export interface FeeUtxo {
+  txid: string;
+  vout: number;
+  satoshis: number;
+  script: string;
+  sourceTransaction?: Transaction;
+}
+
+/** Options for chain execution with fee support */
+export interface ChainExecOptions {
+  /** Fee UTXOs — one per chain step. If provided, added as input 1 to each chain TX. */
+  feeUtxos?: FeeUtxo[];
+  /** Wallet to sign fee inputs. Required if feeUtxos provided. */
+  feeWallet?: Wallet;
+  /** Payment pubkey for the compute agent (receives reward in final TX output 1) */
+  paymentPubkey?: string;
+  /** Payment amount in sats (reward for compute agent) */
+  paymentSats?: number;
+  /** Callback on each chain event */
+  onEvent?: (event: ChainEvent) => void;
+  /** Delay between steps (ms) */
+  stepDelayMs?: number;
+  /** If true, broadcast each TX to regtest immediately */
+  broadcast?: boolean;
+}
 
 // --- Minimal push encoding for scriptSig construction ---
 function pushScriptNum(n: number): number[] {
@@ -104,7 +133,7 @@ export async function fundWalletP2PK(wallet: Wallet, amountBsv: number = 0.05): 
     ),
   });
   tx.addOutput({ lockingScript: wallet.p2pkLockingScript(), change: true });
-  await tx.fee(new SatoshisPerKilobyte(1));
+  await tx.fee(new SatoshisPerKilobyte(config.feePerKb));
   await tx.sign();
   const txid = regtest.broadcastAndMine(tx);
   return {
@@ -145,7 +174,7 @@ export async function bulkFundWalletP2PK(
   // Change
   tx.addOutput({ lockingScript: lockScript, change: true });
 
-  await tx.fee(new SatoshisPerKilobyte(1));
+  await tx.fee(new SatoshisPerKilobyte(config.feePerKb));
   await tx.sign();
 
   const txid = regtest.broadcastAndMine(tx);
@@ -164,16 +193,20 @@ export async function bulkFundWalletP2PK(
 // --- Execute chain steps from a pre-built genesis TX (for worker agents) ---
 // When broadcast=false (default), builds entire chain in memory without touching the network.
 // Returns txChain[] for deferred broadcasting by a BroadcastAgent.
+//
+// With SIGHASH_SINGLE|ANYONECANPAY (0xC3) covenant:
+// - Each chain TX can have a fee input (input 1) to pay miner fees
+// - The final chain TX can include a payment output (output 1) to the compute agent
+// - The covenant only verifies output 0 (covenant continuation) via SIGHASH_SINGLE
 export async function executeChainSteps(
   molecule: Molecule,
   receptor: ReceptorSite,
   compiledAsm: string,
   genesisTx: Transaction,
   genesisTxid: string,
-  onEvent?: (event: ChainEvent) => void,
-  stepDelayMs: number = 0,
-  broadcast: boolean = false,
+  opts: ChainExecOptions = {},
 ): Promise<ChainResult> {
+  const { feeUtxos, feeWallet, paymentPubkey, paymentSats, onEvent, stepDelayMs = 0, broadcast = false } = opts;
   const t0 = performance.now();
   const numAtoms = molecule.atoms.length;
   const numSteps = receptor.atoms.length;
@@ -193,6 +226,7 @@ export async function executeChainSteps(
       const receptorAtom = receptor.atoms[step];
       const batch = computeBatchEnergy(molecule.atoms, receptorAtom);
       const newScore = currentScore + batch.batchTotal;
+      const isLastStep = step === numSteps - 1;
 
       const scriptSigHex = buildChainScriptSig(
         currentTxid, 1, batch.batchTotal, newScore, batch.pairs,
@@ -202,6 +236,7 @@ export async function executeChainSteps(
       chainTx.version = 2;
       chainTx.lockTime = 0;
 
+      // Input 0: covenant UTXO (verified by on-chain script)
       chainTx.addInput({
         sourceTransaction: prevTx,
         sourceOutputIndex: 0,
@@ -209,10 +244,48 @@ export async function executeChainSteps(
         sequence: 0xffffffff,
       });
 
+      // Input 1 (optional): fee UTXO from agent wallet
+      // ANYONECANPAY allows extra inputs without breaking covenant verification
+      const feeUtxo = feeUtxos?.[step];
+      if (feeUtxo && feeWallet) {
+        chainTx.addInput({
+          sourceTransaction: feeUtxo.sourceTransaction,
+          sourceTXID: feeUtxo.txid,
+          sourceOutputIndex: feeUtxo.vout,
+          unlockingScriptTemplate: feeWallet.p2pkUnlock(
+            feeUtxo.satoshis, Script.fromHex(feeUtxo.script),
+          ),
+          sequence: 0xffffffff,
+        });
+      }
+
+      // Output 0: covenant continuation (verified by SIGHASH_SINGLE)
       const nextLock = buildChainLockScript(numAtoms, newScore, compiledAsm);
       chainTx.addOutput({ lockingScript: nextLock, satoshis: 1 });
 
-      // Compute txid locally — no network call needed
+      // Output 1 (final step only): payment to compute agent
+      // SIGHASH_SINGLE only signs output 0, so output 1+ are unconstrained
+      if (isLastStep && paymentPubkey && paymentSats && paymentSats > 0) {
+        const pubkeyBytes = Buffer.from(paymentPubkey, 'hex');
+        const paymentLock = new LockingScript([
+          { op: pubkeyBytes.length, data: [...pubkeyBytes] },
+          { op: 0xac }, // OP_CHECKSIG
+        ]);
+        chainTx.addOutput({ lockingScript: paymentLock, satoshis: paymentSats });
+      }
+
+      // Output 2 (if fee input): change back to fee wallet
+      if (feeUtxo && feeWallet) {
+        chainTx.addOutput({ lockingScript: feeWallet.p2pkLockingScript(), change: true });
+      }
+
+      // Sign fee inputs (covenant input 0 is already signed via scriptSig)
+      if (feeUtxo && feeWallet) {
+        await chainTx.fee(new SatoshisPerKilobyte(config.feePerKb));
+        await chainTx.sign();
+      }
+
+      // Compute txid
       const chainTxid = broadcast
         ? regtest.broadcastOnly(chainTx)
         : chainTx.id('hex');
@@ -299,7 +372,7 @@ export async function executeChain(
     const covenantLock = buildChainLockScript(numAtoms, 0, compiledAsm);
     genesisTx.addOutput({ lockingScript: covenantLock, satoshis: 1 });
     genesisTx.addOutput({ lockingScript: wallet.p2pkLockingScript(), change: true });
-    await genesisTx.fee(new SatoshisPerKilobyte(1));
+    await genesisTx.fee(new SatoshisPerKilobyte(config.feePerKb));
     await genesisTx.sign();
 
     const genesisTxid = broadcast(genesisTx);

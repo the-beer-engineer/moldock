@@ -50,18 +50,20 @@ export function generateChainSx(numAtoms: number): string {
     dup toAltStack      // save inputSats copy
     // Alt: inputSats_copy, scoreOutN, bodyHex
 
-    swap dup            // prevTxid, prevTxid, inputSats
+    swap                // prevTxid, inputSats (no dup — ANYONECANPAY doesn't need prevTxid for hashPrevouts)
 
-    // F1+2: nVersion || hashPrevouts
-    00000000 cat hash256
-    02000000 swap cat
-    // F3: hashSequence
-    ffffffff hash256 cat
-    // F4: outpoint
+    // F1+F2: nVersion(02000000) || hashPrevouts(32 zero bytes for ANYONECANPAY)
+    02000000
+    0000000000000000000000000000000000000000000000000000000000000000
+    cat
+    // F3: hashSequence (32 zero bytes for ANYONECANPAY)
+    0000000000000000000000000000000000000000000000000000000000000000
+    cat
+    // F4: outpoint = prevTxid || vout(00000000)
     swap 00000000 cat cat
-    // F5: scriptCode = 01ac
+    // F5: scriptCode = 01ac (OP_CODESEPARATOR OP_CHECKSIG)
     01ac cat
-    // F6: value
+    // F6: value (input sats, 8 bytes LE)
     swap cat
     // F7: nSequence
     ffffffff cat
@@ -93,12 +95,13 @@ export function generateChainSx(numAtoms: number): string {
     cat
     hash256 cat
 
-    // F9+10
+    // F9: nLockTime
     00000000 cat
-    41000000 cat
+    // F10: nHashType = SIGHASH_SINGLE|ANYONECANPAY|FORKID (0xC3)
+    c3000000 cat
 
-    // Sign
-    41 signCtx
+    // Sign with SIGHASH_SINGLE|ANYONECANPAY|FORKID
+    c3 signCtx
 end
 
 #pairVerify
