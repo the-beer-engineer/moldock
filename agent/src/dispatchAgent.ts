@@ -1,0 +1,390 @@
+/**
+ * MolDock Dispatch Agent — Autonomous bounty posting and work coordination.
+ *
+ * This is the "dispatch" side of the two-agent system required by the hackathon.
+ * It autonomously:
+ *   1. Loads its own BSV wallet (from env or generates new)
+ *   2. Starts the HTTP API server for compute agent discovery
+ *   3. Continuously posts bounties (genesis/covenant TXs) for molecules
+ *   4. Manages work distribution, verification, and payment
+ *   5. Tracks agent trust levels and earnings
+ *
+ * Usage:
+ *   NETWORK=regtest npx tsx src/dispatchAgent.ts
+ *   DISPATCH_PRIVATE_KEY=<wif> NETWORK=testnet npx tsx src/dispatchAgent.ts
+ */
+
+import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import { randomUUID } from 'crypto';
+import { Transaction, Script, SatoshisPerKilobyte } from '@bsv/sdk';
+import { Wallet } from './wallet.js';
+import { DispatchManager } from './dispatch.js';
+import { getCompiledAsm, bulkFundWalletP2PK } from './chainBuilder.js';
+import { buildChainLockScript, createGenesisTx } from './genesis.js';
+import { getRealMolecules } from './generate.js';
+import { dashboardHtml } from './dashboard.js';
+import { config } from './config.js';
+import type { Molecule, ReceptorSite } from './types.js';
+
+import * as regtest from './regtest.js';
+
+// --- Configuration ---
+const PORT = parseInt(process.env.PORT ?? '3456');
+const AUTO_QUEUE_SIZE = parseInt(process.env.AUTO_QUEUE_SIZE ?? '10'); // molecules per batch
+const AUTO_QUEUE_INTERVAL_MS = parseInt(process.env.AUTO_QUEUE_INTERVAL_MS ?? '5000');
+
+// --- Wallet ---
+const wif = process.env.DISPATCH_PRIVATE_KEY;
+const wallet = new Wallet(wif, config.network as any);
+console.log(`\n=== MolDock Dispatch Agent ===`);
+console.log(`Network: ${config.network}`);
+console.log(`Wallet:  ${wallet.address}`);
+console.log(`PubKey:  ${wallet.publicKeyHex}`);
+console.log(`Port:    ${PORT}`);
+if (!wif) console.log(`⚠  No DISPATCH_PRIVATE_KEY set — using ephemeral wallet`);
+
+// --- Dispatch Manager ---
+let dispatch: DispatchManager | null = null;
+let dispatchReady = false;
+
+async function initDispatch(): Promise<void> {
+  console.log(`\n[init] Compiling covenant scripts (~10s)...`);
+  dispatch = new DispatchManager(wallet);
+  dispatchReady = true;
+  console.log(`[init] Dispatch ready — accepting compute agents on http://localhost:${PORT}`);
+}
+
+// --- Autonomous Bounty Posting ---
+let autoQueueRunning = false;
+let totalBountiesPosted = 0;
+
+async function autoQueueLoop(): Promise<void> {
+  if (autoQueueRunning) return;
+  autoQueueRunning = true;
+
+  console.log(`\n[auto] Starting autonomous bounty posting (${AUTO_QUEUE_SIZE} molecules every ${AUTO_QUEUE_INTERVAL_MS}ms)`);
+
+  while (autoQueueRunning) {
+    if (!dispatch) {
+      await sleep(1000);
+      continue;
+    }
+
+    // Only queue more if the external queue is low
+    const stats = dispatch.getStats();
+    const queueDepth = dispatch.getUnifiedStats().queueDepth;
+    if (queueDepth > AUTO_QUEUE_SIZE * 2) {
+      // Plenty of work queued — wait
+      await sleep(AUTO_QUEUE_INTERVAL_MS);
+      continue;
+    }
+
+    try {
+      await postBountyBatch(AUTO_QUEUE_SIZE);
+    } catch (err: any) {
+      console.error(`[auto] Bounty batch failed: ${err.message}`);
+      await sleep(5000);
+    }
+
+    await sleep(AUTO_QUEUE_INTERVAL_MS);
+  }
+}
+
+async function postBountyBatch(count: number): Promise<void> {
+  if (!dispatch) throw new Error('Dispatch not ready');
+
+  const real = getRealMolecules(count);
+  const molecules = real.molecules;
+  const receptor = real.receptor;
+
+  // Pre-compile ASM for all atom counts
+  const atomCounts = [...new Set(molecules.map(m => m.atoms.length))];
+  const asmMap = new Map<number, string>();
+  for (const ac of atomCounts) {
+    asmMap.set(ac, getCompiledAsm(ac));
+  }
+
+  // Bulk fund genesis TXs
+  const fundingUtxos = await bulkFundWalletP2PK(wallet, count, 10000);
+
+  // Create genesis TXs
+  const workItems: Array<{
+    molecule: Molecule; receptor: ReceptorSite; compiledAsm: string;
+    genesisTxHex: string; genesisTxid: string;
+  }> = [];
+
+  let txsSinceLastMine = 0;
+  for (let i = 0; i < count; i++) {
+    const mol = molecules[i];
+    const utxo = fundingUtxos[i];
+    const compiledAsm = asmMap.get(mol.atoms.length)!;
+
+    const genesisTx = new Transaction();
+    genesisTx.version = 2;
+    genesisTx.addInput({
+      sourceTransaction: utxo.sourceTransaction,
+      sourceOutputIndex: utxo.vout,
+      unlockingScriptTemplate: wallet.p2pkUnlock(utxo.satoshis, Script.fromHex(utxo.script)),
+    });
+    genesisTx.addOutput({ lockingScript: buildChainLockScript(mol.atoms.length, 0, compiledAsm), satoshis: 1 });
+    genesisTx.addOutput({ lockingScript: wallet.p2pkLockingScript(), change: true });
+    await genesisTx.fee(new SatoshisPerKilobyte(config.feePerKb));
+    await genesisTx.sign();
+
+    const genesisTxid = regtest.broadcastOnly(genesisTx);
+    txsSinceLastMine++;
+
+    workItems.push({
+      molecule: mol,
+      receptor,
+      compiledAsm,
+      genesisTxHex: genesisTx.toHex(),
+      genesisTxid,
+    });
+
+    if (txsSinceLastMine >= 20) {
+      regtest.mine(1);
+      txsSinceLastMine = 0;
+    }
+  }
+  if (txsSinceLastMine > 0) regtest.mine(1);
+
+  // Enqueue into dispatch
+  const batchId = randomUUID().slice(0, 8);
+  dispatch.startTime = dispatch.startTime || performance.now();
+  dispatch.enqueueExternalWork(workItems, batchId);
+
+  totalBountiesPosted += count;
+  console.log(`[auto] Posted ${count} bounties (batch ${batchId}, total: ${totalBountiesPosted})`);
+}
+
+// --- HTTP Server ---
+function json(res: ServerResponse, data: any, status = 200): void {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  });
+  res.end(JSON.stringify(data));
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    req.on('error', reject);
+  });
+}
+
+function serializeWork(work: any) {
+  return {
+    id: work.id,
+    molecule: work.molecule,
+    receptor: work.receptor,
+    compiledAsm: work.compiledAsm,
+    genesisTxHex: work.genesisTxHex,
+    genesisTxid: work.genesisTxid,
+    numSteps: work.numSteps,
+  };
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+  const method = req.method ?? 'GET';
+
+  if (method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    });
+    res.end();
+    return;
+  }
+
+  // --- Dashboard ---
+  if (method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(dashboardHtml());
+    return;
+  }
+
+  // --- Stats ---
+  if (method === 'GET' && url.pathname === '/api/stats') {
+    if (!dispatch) { json(res, { status: 'initializing' }); return; }
+    const ds = dispatch.getUnifiedStats();
+    let blockHeight = 0;
+    try { blockHeight = regtest.getBlockCount(); } catch {}
+    json(res, {
+      status: ds.totalAgents > 0 ? 'running' : 'waiting',
+      ...ds,
+      blockHeight,
+      totalBountiesPosted,
+      network: config.network,
+      dispatchWallet: wallet.address,
+    });
+    return;
+  }
+
+  // --- Agents ---
+  if (method === 'GET' && url.pathname === '/api/agents') {
+    if (!dispatch) { json(res, []); return; }
+    json(res, dispatch.getAgentsForDashboard());
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/api/events') {
+    if (!dispatch) { json(res, []); return; }
+    json(res, dispatch.getRecentEvents());
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/api/results') {
+    if (!dispatch) { json(res, []); return; }
+    json(res, dispatch.getResults());
+    return;
+  }
+
+  // --- Agent Registration ---
+  if (method === 'POST' && url.pathname === '/api/agent/register') {
+    if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
+    const body = JSON.parse(await readBody(req));
+    const result = dispatch.registerAgent(body.name, body.pubkey, body.paymail);
+    if (result.error) { json(res, { error: result.error }, 400); return; }
+    json(res, { agent: result.agent }, 201);
+    return;
+  }
+
+  // --- Agent Name Check ---
+  const nameCheckMatch = url.pathname.match(/^\/api\/agent\/check-name\/(.+)$/);
+  if (method === 'GET' && nameCheckMatch) {
+    if (!dispatch) { json(res, { available: true }); return; }
+    json(res, { available: !dispatch.isNameTaken(decodeURIComponent(nameCheckMatch[1])) });
+    return;
+  }
+
+  // --- Agent Work ---
+  const agentWorkMatch = url.pathname.match(/^\/api\/agent\/([^/]+)\/work$/);
+  if (method === 'GET' && agentWorkMatch) {
+    if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
+    const agentId = agentWorkMatch[1];
+    const result = await dispatch.createWorkPackage(agentId);
+    if (result.error) { json(res, { error: result.error }, 400); return; }
+    json(res, { work: serializeWork(result.work!) });
+    return;
+  }
+
+  // --- Agent Submit Fail ---
+  const failMatch = url.pathname.match(/^\/api\/agent\/([^/]+)\/fail$/);
+  if (method === 'POST' && failMatch) {
+    if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
+    const agentId = failMatch[1];
+    const body = JSON.parse(await readBody(req));
+    const result = await dispatch.submitFail(agentId, body.workId, body.finalScore);
+    if (!result.ok) { json(res, { error: result.error }, 400); return; }
+    json(res, {
+      ok: true,
+      nextWork: result.nextWork ? serializeWork(result.nextWork) : null,
+    });
+    return;
+  }
+
+  // --- Agent Submit Pass ---
+  const passMatch = url.pathname.match(/^\/api\/agent\/([^/]+)\/pass$/);
+  if (method === 'POST' && passMatch) {
+    if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
+    const agentId = passMatch[1];
+    const body = JSON.parse(await readBody(req));
+    const result = await dispatch.submitPass(agentId, body.workId, body.finalScore, body.chainTxHexes ?? []);
+    if (!result.ok) { json(res, { error: result.error }, 400); return; }
+    json(res, { ok: true, feePackage: result.feePackage });
+    return;
+  }
+
+  // --- Agent Confirm Broadcast ---
+  const confirmMatch = url.pathname.match(/^\/api\/agent\/([^/]+)\/confirm$/);
+  if (method === 'POST' && confirmMatch) {
+    if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
+    const agentId = confirmMatch[1];
+    const body = JSON.parse(await readBody(req));
+    const result = await dispatch.confirmBroadcast(agentId, body.workId, body.txids ?? []);
+    if (!result.ok) { json(res, { error: result.error }, 400); return; }
+    json(res, {
+      ok: true,
+      nextWork: result.nextWork ? serializeWork(result.nextWork) : null,
+    });
+    return;
+  }
+
+  // --- Manual Dock (dashboard button) ---
+  if (method === 'POST' && url.pathname === '/api/dock') {
+    if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
+    const body = JSON.parse(await readBody(req));
+    const count = body.numMolecules ?? 10;
+    try {
+      await postBountyBatch(count);
+      json(res, { ok: true, posted: count });
+    } catch (err: any) {
+      json(res, { error: err.message }, 500);
+    }
+    return;
+  }
+
+  // --- Node Info ---
+  if (method === 'GET' && url.pathname === '/api/node') {
+    try {
+      const height = regtest.getBlockCount();
+      json(res, { status: 'connected', height, network: config.network });
+    } catch {
+      json(res, { status: 'disconnected', network: config.network });
+    }
+    return;
+  }
+
+  // --- Discovery endpoint (compute agents find dispatch) ---
+  if (method === 'GET' && url.pathname === '/api/discover') {
+    json(res, {
+      service: 'moldock-dispatch',
+      version: '1.0.0',
+      network: config.network,
+      dispatchPubkey: wallet.publicKeyHex,
+      dispatchAddress: wallet.address,
+      endpoints: {
+        register: '/api/agent/register',
+        work: '/api/agent/:id/work',
+        submitPass: '/api/agent/:id/pass',
+        submitFail: '/api/agent/:id/fail',
+        confirmBroadcast: '/api/agent/:id/confirm',
+      },
+    });
+    return;
+  }
+
+  // 404
+  json(res, { error: 'Not found' }, 404);
+}
+
+// --- Start ---
+const server = createServer((req, res) => {
+  handleRequest(req, res).catch(err => {
+    console.error('[server] Error:', err.message);
+    json(res, { error: 'Internal error' }, 500);
+  });
+});
+
+server.listen(PORT, async () => {
+  console.log(`\n[server] Listening on http://localhost:${PORT}`);
+  console.log(`[server] Dashboard: http://localhost:${PORT}/dashboard`);
+  console.log(`[server] Discovery: http://localhost:${PORT}/api/discover`);
+
+  // Initialize dispatch (compiles scripts)
+  await initDispatch();
+
+  // Start autonomous bounty posting
+  autoQueueLoop();
+});
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}

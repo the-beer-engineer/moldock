@@ -16,10 +16,15 @@
     "test:genesis": "tsx src/testGenesisRegtest.ts",
     "generate": "tsx src/generate.ts",
     "serve": "tsx src/server.ts",
+    "dispatch": "tsx src/dispatchAgent.ts",
+    "compute": "tsx src/computeAgent.ts",
+    "compute:auto": "tsx src/computeAgent.ts --no-prompt --name",
     "fetch-molecules": "tsx src/realMolecules.ts",
     "verify": "tsx src/verifier.ts",
     "agent": "tsx src/agentClient.ts",
     "agent:connect": "tsx src/agentClient.ts --server",
+    "test:sighash": "tsx src/testSighashFix.ts",
+    "test:chain-fees": "tsx src/testFullChainWithFees.ts",
     "build:agent": "bash scripts/build-binary.sh"
   },
   "dependencies": {
