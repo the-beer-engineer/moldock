@@ -20,7 +20,8 @@ const __dirname = dirname(__filename);
 const STATE_FILE = resolve(__dirname, '../../.moldock-state.json');
 
 interface PersistedResult {
-  moleculeId: string;
+  moleculeId: string;      // full ID including pose suffix
+  baseMoleculeId: string;  // base drug name (without random pose suffix)
   agentName: string;
   passed: boolean;
   finalScore: number;
@@ -29,20 +30,27 @@ interface PersistedResult {
   chainSteps: number;
 }
 
+/** Max results to persist — keeps only the best score per base molecule */
+const MAX_PERSISTED_RESULTS = 200;
+
 interface PersistedState {
   cumulativeTxs: number;
   cumulativeRewardsSats: number;
   cumulativeProcessed: number;
   cumulativePassed: number;
   cumulativeFailed: number;
+  /** Best result per base molecule (capped at MAX_PERSISTED_RESULTS) */
   results?: PersistedResult[];
-  events?: DispatchEvent[];
+  /** "baseMoleculeId::receptorId" keys already tested — for dedup */
+  testedKeys?: string[];
+  // Legacy field (no longer written, ignored on load)
+  events?: unknown;
 }
 
 const EMPTY_STATE: PersistedState = {
   cumulativeTxs: 0, cumulativeRewardsSats: 0,
   cumulativeProcessed: 0, cumulativePassed: 0, cumulativeFailed: 0,
-  results: [], events: [],
+  results: [], testedKeys: [],
 };
 
 function loadState(): PersistedState {
@@ -56,6 +64,30 @@ function loadState(): PersistedState {
 
 function saveState(state: PersistedState): void {
   try { writeFileSync(STATE_FILE, JSON.stringify(state)); } catch { /* ignore */ }
+}
+
+/** Extract the base molecule name (strip the random pose suffix like "-a3xf") */
+function baseMolId(moleculeId: string): string {
+  return moleculeId.replace(/-[a-z0-9]{4}$/, '');
+}
+
+/** Deduplicate results: keep only the best (lowest) score per base molecule, cap at N */
+function deduplicateResults(results: PersistedResult[]): PersistedResult[] {
+  const best = new Map<string, PersistedResult>();
+  for (const r of results) {
+    const key = r.baseMoleculeId || baseMolId(r.moleculeId);
+    const existing = best.get(key);
+    // Lower score = better docking. Prefer passes over fails.
+    if (!existing ||
+        (r.passed && !existing.passed) ||
+        (r.passed === existing.passed && r.finalScore < existing.finalScore)) {
+      best.set(key, { ...r, baseMoleculeId: key });
+    }
+  }
+  // Sort by score ascending (best first), cap at MAX
+  return [...best.values()]
+    .sort((a, b) => a.finalScore - b.finalScore)
+    .slice(0, MAX_PERSISTED_RESULTS);
 }
 
 // --- Types ---
@@ -162,6 +194,10 @@ export class DispatchManager {
   private sessionEvents: DispatchEvent[] = [];
   private maxEvents = 500;
 
+  // Dedup: "baseMoleculeId::receptorId" keys already tested (persisted + session)
+  private testedKeys = new Set<string>();
+  private sessionTestedKeys: string[] = [];
+
   // Timing & limits
   startTime = 0;
   readonly MAX_RUN_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -179,7 +215,12 @@ export class DispatchManager {
     this.network = getNetwork();
     this.persistedState = loadState();
     if (this.persistedState.cumulativeTxs > 0) {
-      console.log(`[dispatch] Restored state: ${this.persistedState.cumulativeTxs} cumulative TXs, ${this.persistedState.cumulativeProcessed} processed`);
+      console.log(`[dispatch] Restored state: ${this.persistedState.cumulativeTxs} cumulative TXs, ${this.persistedState.cumulativeProcessed} processed, ${(this.persistedState.results ?? []).length} results`);
+    }
+
+    // Restore dedup keys from persisted state
+    for (const key of this.persistedState.testedKeys ?? []) {
+      this.testedKeys.add(key);
     }
 
     // Load real molecules or generate synthetic ones
@@ -299,10 +340,14 @@ export class DispatchManager {
   }
 
   getRecentEvents(): DispatchEvent[] {
-    // Merge persisted events from prior sessions with current session events
-    const persisted = this.persistedState.events ?? [];
-    const all = [...persisted, ...this.sessionEvents];
-    return all.slice(-this.maxEvents);
+    return this.sessionEvents;
+  }
+
+  /** Mark a molecule+receptor as tested (for dedup across sessions) */
+  private markTested(work: WorkPackage): void {
+    const key = `${baseMolId(work.molecule.id)}::${work.receptor.id || work.receptor.name}`;
+    this.testedKeys.add(key);
+    this.sessionTestedKeys.push(key);
   }
 
   // --- Agent Registration ---
@@ -398,18 +443,32 @@ export class DispatchManager {
       return { work };
     }
 
-    // Refill default queue if empty
+    // Refill default queue if empty — prioritize untested molecule+receptor combos
     if (this.moleculeQueue.length === 0) {
-      this.moleculeQueue = this.molecules.map(m => ({
-        ...m,
-        id: `${m.id.split('-')[0]}-${Math.random().toString(36).slice(2, 6)}`,
-        atoms: m.atoms.map(a => ({
-          ...a,
-          x: a.x + Math.floor(Math.random() * 40 - 20),
-          y: a.y + Math.floor(Math.random() * 40 - 20),
-          z: a.z + Math.floor(Math.random() * 40 - 20),
-        })),
-      }));
+      // First: find molecules that haven't been tested against their receptor yet
+      const untested = this.molecules.filter(m => {
+        const receptor = (m.receptorId && this.receptors.get(m.receptorId)) || this.receptor;
+        const key = `${baseMolId(m.id)}::${receptor.id || receptor.name}`;
+        return !this.testedKeys.has(key);
+      });
+
+      if (untested.length > 0) {
+        this.moleculeQueue = untested;
+        console.log(`[dispatch] Queue refilled: ${untested.length} untested molecules (${this.testedKeys.size} already tested)`);
+      } else {
+        // All molecules tested at least once — generate new poses (perturbed coordinates)
+        this.moleculeQueue = this.molecules.map(m => ({
+          ...m,
+          id: `${baseMolId(m.id)}-${Math.random().toString(36).slice(2, 6)}`,
+          atoms: m.atoms.map(a => ({
+            ...a,
+            x: a.x + Math.floor(Math.random() * 40 - 20),
+            y: a.y + Math.floor(Math.random() * 40 - 20),
+            z: a.z + Math.floor(Math.random() * 40 - 20),
+          })),
+        }));
+        console.log(`[dispatch] All ${this.molecules.length} molecules tested — generating new poses`);
+      }
     }
 
     const molecule = this.moleculeQueue.shift()!;
@@ -505,6 +564,7 @@ export class DispatchManager {
       console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
     }
 
+    this.markTested(work);
     this.pushEvent({ type: 'fail', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore });
     this.trackBatchCompletion(work.batchId);
     this.persistState();
@@ -568,6 +628,7 @@ export class DispatchManager {
       try { await this.payReward(agent, passReward); } catch (err: any) {
         console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
       }
+      this.markTested(work);
       this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore, rewardSats: passReward });
       this.persistState();
       console.log(`[dispatch] ${agent.name} PASS verified for ${workId} (score=${finalScore}) reward=${passReward} sats [browser-broadcast]`);
@@ -602,6 +663,7 @@ export class DispatchManager {
         console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
       }
 
+      this.markTested(work);
       this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore, rewardSats: passReward });
       this.persistState();
       console.log(`[dispatch] ${agent.name} PASS verified for ${workId} (score=${finalScore}) reward=${passReward} sats. ${chainSteps} fee UTXOs created.`);
@@ -886,13 +948,18 @@ export class DispatchManager {
     const sessionFailed = agents.reduce((s, a) => s + a.totalFailed, 0);
     const sessionRewards = agents.reduce((s, a) => s + a.totalRewardsSats, 0);
 
-    // Merge session results with previously persisted results
+    // Merge session results with persisted, deduplicate (best per base molecule), cap size
     const sessionResults = this.getSessionResults();
-    const allResults = [...(this.persistedState.results ?? []), ...sessionResults];
+    const allResults = deduplicateResults([
+      ...(this.persistedState.results ?? []),
+      ...sessionResults,
+    ]);
 
-    // Merge events: keep last 500 across all sessions
-    const allEvents = [...(this.persistedState.events ?? []), ...this.sessionEvents];
-    const trimmedEvents = allEvents.slice(-this.maxEvents);
+    // Merge tested keys (for dedup across restarts)
+    const testedKeys = [...new Set([
+      ...(this.persistedState.testedKeys ?? []),
+      ...this.sessionTestedKeys,
+    ])];
 
     saveState({
       cumulativeTxs: this.persistedState.cumulativeTxs + sessionTxs,
@@ -901,7 +968,7 @@ export class DispatchManager {
       cumulativePassed: this.persistedState.cumulativePassed + sessionPassed,
       cumulativeFailed: this.persistedState.cumulativeFailed + sessionFailed,
       results: allResults,
-      events: trimmedEvents,
+      testedKeys,
     });
   }
 
@@ -913,6 +980,7 @@ export class DispatchManager {
         const agent = this.agents.get(w.agentId);
         results.push({
           moleculeId: w.molecule.id,
+          baseMoleculeId: baseMolId(w.molecule.id),
           agentName: agent?.name ?? 'unknown',
           passed: w.status === 'pass' || w.status === 'verified',
           finalScore: w.finalScore ?? 0,
