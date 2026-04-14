@@ -8,7 +8,7 @@ import { getCompiledAsm } from './chainBuilder.js';
 import { buildChainLockScript } from './genesis.js';
 import { computeBatchEnergy } from './energy.js';
 import { generateMolecule, generateReceptorSite, getRealMolecules } from './generate.js';
-import * as regtest from './regtest.js';
+import { getNetwork, type NetworkAdapter } from './network.js';
 import type { Molecule, ReceptorSite } from './types.js';
 import { bulkFundWalletP2PK } from './chainBuilder.js';
 
@@ -58,6 +58,9 @@ export interface WorkPackage {
   completedAt?: string;
   finalScore?: number;
   chainTxids?: string[];    // submitted chain txids
+  chainTxHexes?: string[];  // full chain hex (genesis + steps) submitted by browser for rebroadcast insurance
+  broadcastAt?: number;     // performance.now() when agent reported broadcast
+  rebroadcastCount?: number;// how many times dispatch has re-broadcast this chain
   batchId?: string;         // links to dashboard-initiated job
 }
 
@@ -84,14 +87,16 @@ export class DispatchManager {
   private agentsByName = new Map<string, string>(); // name → id
   private work = new Map<string, WorkPackage>();
   private dispatchWallet: Wallet;
+  private network: NetworkAdapter;
 
   // Pre-compiled ASM cache
   private asmCache = new Map<number, string>();
 
-  // Default receptor for work generation
-  private receptor: ReceptorSite;
-  private molecules: Molecule[] = [];
-  private moleculeQueue: Molecule[] = [];
+  // Receptor sites (multi-target support)
+  private receptors: Map<string, ReceptorSite>;
+  private receptor: ReceptorSite; // first/default receptor for backward compat
+  private molecules: Array<Molecule & { receptorId?: string }> = [];
+  private moleculeQueue: Array<Molecule & { receptorId?: string }> = [];
 
   // External work queue (from dashboard job triggers)
   private externalQueue: Array<{
@@ -110,14 +115,18 @@ export class DispatchManager {
   private recentEvents: DispatchEvent[] = [];
   private maxEvents = 500;
 
-  // Timing
+  // Timing & limits
   startTime = 0;
+  readonly MAX_RUN_MS = 24 * 60 * 60 * 1000; // 24 hours
+  readonly TX_TARGET = 1_500_000;
 
   constructor(wallet: Wallet) {
     this.dispatchWallet = wallet;
+    this.network = getNetwork();
 
     // Load real molecules or generate synthetic ones
     const real = getRealMolecules(100);
+    this.receptors = real.receptors;
     this.receptor = real.receptor;
     this.molecules = real.molecules;
     this.moleculeQueue = [...this.molecules];
@@ -254,6 +263,9 @@ export class DispatchManager {
       this.asmCache.set(numAtoms, compiledAsm);
     }
 
+    // Look up the receptor for this molecule (fall back to default)
+    const molReceptor = (molecule.receptorId && this.receptors.get(molecule.receptorId)) || this.receptor;
+
     // Create genesis TX funded from dispatch wallet
     try {
       const fundingUtxos = await bulkFundWalletP2PK(this.dispatchWallet, 1, 2000);
@@ -272,19 +284,19 @@ export class DispatchManager {
       await genesisTx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
       await genesisTx.sign();
 
-      const genesisTxid = regtest.broadcastOnly(genesisTx);
-      regtest.mine(1);
+      const genesisTxid = await this.network.broadcast(genesisTx);
+      await this.network.mine(1);
 
       const workId = Math.random().toString(36).slice(2, 10);
       const work: WorkPackage = {
         id: workId,
         agentId,
         molecule,
-        receptor: this.receptor,
+        receptor: molReceptor,
         compiledAsm,
         genesisTxHex: genesisTx.toHex(),
         genesisTxid,
-        numSteps: this.receptor.atoms.length,
+        numSteps: molReceptor.atoms.length,
         status: 'assigned',
         assignedAt: new Date().toISOString(),
       };
@@ -295,7 +307,7 @@ export class DispatchManager {
       agent.lastSeen = new Date().toISOString();
       this.pushEvent({ type: 'assigned', agentName: agent.name, agentId, moleculeId: molecule.id });
 
-      console.log(`[dispatch] Work ${workId} assigned to ${agent.name}: ${molecule.id} (${numAtoms} atoms, ${this.receptor.atoms.length} steps)`);
+      console.log(`[dispatch] Work ${workId} assigned to ${agent.name}: ${molecule.id} (${numAtoms} atoms, ${molReceptor.atoms.length} steps, receptor=${molReceptor.id})`);
       return { work };
     } catch (err: any) {
       return { error: `Genesis creation failed: ${err.message}` };
@@ -347,6 +359,7 @@ export class DispatchManager {
   async submitPass(
     agentId: string, workId: string, finalScore: number,
     chainTxHexes: string[],
+    alreadyBroadcast: boolean = false,
   ): Promise<{ ok: boolean; feePackage?: FeePackage; error?: string }> {
     const agent = this.agents.get(agentId);
     const work = this.work.get(workId);
@@ -374,6 +387,26 @@ export class DispatchManager {
       agent.currentMoleculeId = null;
       this.pushEvent({ type: 'spot_check_fail', agentName: agent.name, agentId, moleculeId: work.molecule.id });
       return { ok: false, error: 'Spot check failed — score mismatch' };
+    }
+
+    // Browser-agent fast path: agent already broadcast chain directly.
+    // Skip fee UTXO creation entirely (browser uses 1-sat simple chain on regtest
+    // or pays its own fees on testnet/mainnet via ARC).
+    if (alreadyBroadcast) {
+      // Store full chain hex so dispatch can re-broadcast later if TXs are lost.
+      work.chainTxHexes = chainTxHexes;
+      work.broadcastAt = performance.now();
+      work.rebroadcastCount = 0;
+      work.status = 'verified';
+      agent.totalTxsBroadcast += chainTxHexes.length + 1;
+      if (agent.totalPassed >= 5 && agent.trustLevel < 1) agent.trustLevel = 1;
+      if (agent.totalPassed >= 20 && agent.trustLevel < 2) agent.trustLevel = 2;
+      try { await this.payReward(agent); } catch (err: any) {
+        console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
+      }
+      this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore });
+      console.log(`[dispatch] ${agent.name} PASS verified for ${workId} (score=${finalScore}) [browser-broadcast]`);
+      return { ok: true };
     }
 
     // Create fee UTXOs for the agent to broadcast the chain
@@ -476,8 +509,8 @@ export class DispatchManager {
     await feeTx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
     await feeTx.sign();
 
-    const feeTxid = regtest.broadcastOnly(feeTx);
-    regtest.mine(1);
+    const feeTxid = await this.network.broadcast(feeTx);
+    await this.network.mine(1);
 
     const result: FeePackage['utxos'] = [];
     for (let i = 0; i < count; i++) {
@@ -519,8 +552,8 @@ export class DispatchManager {
     await rewardTx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
     await rewardTx.sign();
 
-    const txid = regtest.broadcastOnly(rewardTx);
-    regtest.mine(1);
+    const txid = await this.network.broadcast(rewardTx);
+    await this.network.mine(1);
     agent.totalRewardsSats += REWARD_PER_WORK_SATS;
     console.log(`[dispatch] Paid ${REWARD_PER_WORK_SATS} sats to ${agent.name} (total: ${agent.totalRewardsSats} sats) txid=${txid}`);
     return txid;
@@ -569,6 +602,79 @@ export class DispatchManager {
     return this.batches.get(batchId) ?? null;
   }
 
+  // --- Chain verification / rebroadcast insurance ---
+  //
+  // The browser compute agents broadcast chains directly, then submit the full hex
+  // back to dispatch. Dispatch periodically checks whether the head TX of each recently
+  // verified chain is actually in the mempool or confirmed. If the node has no record
+  // of it (dropped, rejected silently, node restart, etc.) dispatch re-broadcasts the
+  // whole chain using its own broadcaster.
+  async verifyAndRebroadcastRecent(opts: { ageMsMin?: number; maxPerRun?: number } = {}): Promise<{ checked: number; rebroadcast: number; dropped: number }> {
+    const ageMsMin = opts.ageMsMin ?? 5_000;   // give node a few seconds to accept
+    const maxPerRun = opts.maxPerRun ?? 50;
+    const now = performance.now();
+    let checked = 0, rebroadcast = 0, dropped = 0;
+
+    for (const work of this.work.values()) {
+      if (checked >= maxPerRun) break;
+      if (work.status !== 'verified') continue;
+      if (!work.chainTxHexes || work.chainTxHexes.length === 0) continue;
+      if (!work.broadcastAt || (now - work.broadcastAt) < ageMsMin) continue;
+      if ((work.rebroadcastCount ?? 0) >= 3) continue; // give up after 3 attempts
+
+      // Check the HEAD of the chain — if the head is in mempool or mined, the whole chain is fine.
+      const headTxid = work.chainTxids?.[work.chainTxids.length - 1];
+      if (!headTxid) continue;
+      checked++;
+
+      // Re-broadcast the chain proactively (on mainnet we can't check mempool status easily)
+      // Just attempt to replay — ARC/node will reject already-known TXs harmlessly
+      if (this.network.getNetwork() !== 'regtest') {
+        // On mainnet/testnet: re-broadcast entire chain via ARC
+        work.rebroadcastCount = (work.rebroadcastCount ?? 0) + 1;
+        let replayed = 0;
+        for (const hex of work.chainTxHexes) {
+          try {
+            await this.network.broadcastHex(hex);
+            replayed++;
+          } catch (err: any) {
+            if (/already|duplicate|known/i.test(err.message)) { replayed++; continue; }
+            break;
+          }
+        }
+        if (replayed > 0) rebroadcast++;
+        else dropped++;
+        work.broadcastAt = performance.now();
+      } else {
+        // On regtest: check mempool status via bitcoin-cli
+        let regtest: typeof import('./regtest.js') | null = null;
+        try { regtest = await import('./regtest.js'); } catch { continue; }
+        let status;
+        try { status = regtest!.getTxStatus(headTxid); } catch { continue; }
+        if (status.confirmations === null) {
+          work.rebroadcastCount = (work.rebroadcastCount ?? 0) + 1;
+          let replayed = 0;
+          for (const hex of work.chainTxHexes) {
+            try {
+              regtest!.sendRawTx(hex);
+              replayed++;
+            } catch (err: any) {
+              if (/already.known|txn.already/i.test(err.message)) { replayed++; continue; }
+              break;
+            }
+          }
+          if (replayed > 0) rebroadcast++;
+          else dropped++;
+          work.broadcastAt = performance.now();
+        } else if (status.confirmations > 0) {
+          delete work.chainTxHexes;
+        }
+      }
+    }
+
+    return { checked, rebroadcast, dropped };
+  }
+
   // --- Stats ---
 
   getStats() {
@@ -586,7 +692,7 @@ export class DispatchManager {
   }
 
   /** Unified stats for the dashboard — replaces the old local-worker stats */
-  getUnifiedStats() {
+  async getUnifiedStats() {
     const agents = [...this.agents.values()];
     const workItems = [...this.work.values()];
     const totalProcessed = agents.reduce((s, a) => s + a.totalProcessed, 0);
@@ -596,6 +702,27 @@ export class DispatchManager {
     const totalBytes = agents.reduce((s, a) => s + a.totalBytes, 0);
     const totalRewards = agents.reduce((s, a) => s + a.totalRewardsSats, 0);
     const elapsed = this.startTime > 0 ? performance.now() - this.startTime : 0;
+
+    const txsPerSecond = elapsed > 0 ? totalTxs / (elapsed / 1000) : 0;
+    const avgTxsPerMol = totalProcessed > 0 ? Math.round(totalTxs / totalProcessed) : 21;
+
+    // Time remaining estimate based on current rate
+    const txsRemaining = Math.max(0, this.TX_TARGET - totalTxs);
+    const etaMs = txsPerSecond > 0 ? (txsRemaining / txsPerSecond) * 1000 : 0;
+    const timeRemainingMs = Math.max(0, this.MAX_RUN_MS - elapsed);
+
+    // Wallet balance — use network adapter (regtest: node wallet, mainnet: WoC API)
+    let walletBalanceSats = 0;
+    try {
+      walletBalanceSats = await this.network.getBalance(this.dispatchWallet.address);
+    } catch {
+      try { walletBalanceSats = this.dispatchWallet.balance; } catch {}
+    }
+
+    // Run status flags
+    const targetReached = totalTxs >= this.TX_TARGET;
+    const timeExpired = elapsed > 0 && elapsed >= this.MAX_RUN_MS;
+    const fundsExhausted = walletBalanceSats < 500; // less than 500 sats = effectively empty
 
     return {
       totalAgents: agents.length,
@@ -607,10 +734,35 @@ export class DispatchManager {
       totalBytes,
       totalRewards,
       elapsedMs: elapsed,
-      txsPerSecond: elapsed > 0 ? totalTxs / (elapsed / 1000) : 0,
+      txsPerSecond,
+      avgTxsPerMol,
       queueDepth: this.externalQueue.length + this.moleculeQueue.length,
       workCreated: workItems.length,
+      // Enhanced metrics
+      txTarget: this.TX_TARGET,
+      txsRemaining,
+      etaMs,
+      timeRemainingMs,
+      maxRunMs: this.MAX_RUN_MS,
+      walletBalanceSats,
+      targetReached,
+      timeExpired,
+      fundsExhausted,
+      moleculeCount: this.molecules.length,
+      receptorCount: this.receptors.size,
+      receptorAtoms: this.receptors.size > 0
+        ? Math.round([...this.receptors.values()].reduce((s, r) => s + r.atoms.length, 0) / this.receptors.size)
+        : this.receptor.atoms.length,
     };
+  }
+
+  /** Check if the run should auto-stop */
+  async shouldStop(): Promise<{ stop: boolean; reason: string }> {
+    const stats = await this.getUnifiedStats();
+    if (stats.targetReached) return { stop: true, reason: 'TX target reached (' + stats.totalTxs.toLocaleString() + ')' };
+    if (stats.timeExpired) return { stop: true, reason: '24h run duration expired' };
+    if (stats.fundsExhausted) return { stop: true, reason: 'Wallet funds exhausted (' + stats.walletBalanceSats + ' sats remaining)' };
+    return { stop: false, reason: '' };
   }
 
   /** Agent data formatted for dashboard display */
@@ -654,10 +806,12 @@ export class DispatchManager {
   getResults(): Array<{
     moleculeId: string; agentName: string; passed: boolean;
     finalScore: number; totalTxs: number; totalBytes: number;
+    receptorName: string; chainSteps: number;
   }> {
     const results: Array<{
       moleculeId: string; agentName: string; passed: boolean;
       finalScore: number; totalTxs: number; totalBytes: number;
+      receptorName: string; chainSteps: number;
     }> = [];
     for (const w of this.work.values()) {
       if (w.status === 'pass' || w.status === 'verified' || w.status === 'fail') {
@@ -668,7 +822,9 @@ export class DispatchManager {
           passed: w.status === 'pass' || w.status === 'verified',
           finalScore: w.finalScore ?? 0,
           totalTxs: w.numSteps + 1,
-          totalBytes: 0, // individual bytes not tracked per work item
+          totalBytes: 0,
+          receptorName: w.receptor.name ?? '',
+          chainSteps: w.numSteps,
         });
       }
     }

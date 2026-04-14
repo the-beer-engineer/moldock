@@ -224,7 +224,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // GET /api/stats — unified stats from dispatch
   if (method === 'GET' && url.pathname === '/api/stats') {
     if (!dispatchManager) { json(res, { status: dispatchInitializing ? 'initializing' : 'unavailable' }); return; }
-    const ds = dispatchManager.getUnifiedStats();
+    const ds = await dispatchManager.getUnifiedStats();
     const blockHeight = (() => { try { return regtest.getBlockCount(); } catch { return 0; } })();
     const activeJob = activeJobId ? jobs.get(activeJobId) : null;
     const lastJob = activeJob ?? [...jobs.values()].reverse().find(j => j.status === 'completed');

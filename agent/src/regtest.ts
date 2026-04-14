@@ -95,3 +95,21 @@ export function broadcastAndMine(tx: Transaction): string {
   mine(1);
   return txid;
 }
+
+// Return the current mempool as an array of txids.
+export function getRawMempool(): string[] {
+  try { return JSON.parse(cli('getrawmempool')); } catch { return []; }
+}
+
+// Returns number of confirmations for a txid, or null if unknown / not found.
+// 0 = in mempool only; >0 = mined; null = node has no record of it.
+export function getTxStatus(txid: string): { confirmations: number | null; inMempool: boolean } {
+  try {
+    const raw = cli(`getrawtransaction ${txid} 1`);
+    const obj = JSON.parse(raw);
+    const conf = typeof obj.confirmations === 'number' ? obj.confirmations : 0;
+    return { confirmations: conf, inMempool: conf === 0 };
+  } catch {
+    return { confirmations: null, inMempool: false };
+  }
+}

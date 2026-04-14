@@ -12,16 +12,24 @@ export type NetworkType = 'regtest' | 'testnet' | 'mainnet';
 export interface NetworkAdapter {
   /** Broadcast a single transaction, return txid */
   broadcast(tx: Transaction): Promise<string>;
+  /** Broadcast raw hex, return txid */
+  broadcastHex(hex: string): Promise<string>;
   /** Broadcast multiple transactions in order, return txids */
   broadcastBatch(txs: Transaction[]): Promise<string[]>;
   /** Fund a wallet address (regtest only — testnet/mainnet must be pre-funded) */
   fund(address: string, amountBsv: number): Promise<UTXO>;
+  /** Fetch UTXOs for an address (mainnet/testnet: WhatsOnChain, regtest: listunspent) */
+  fetchUtxos(address: string): Promise<UTXO[]>;
+  /** Get wallet balance in sats */
+  getBalance(address: string): Promise<number>;
   /** Get current network type */
   getNetwork(): NetworkType;
   /** Mine blocks (regtest only — no-op on testnet/mainnet) */
   mine(n?: number): Promise<void>;
   /** Get WhatsOnChain URL for a txid (empty on regtest) */
   getTxUrl(txid: string): string;
+  /** Get block height (0 on testnet/mainnet if unavailable) */
+  getBlockHeight(): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +71,11 @@ export class RegtestAdapter implements NetworkAdapter {
     return r.broadcastOnly(tx);
   }
 
+  async broadcastHex(hex: string): Promise<string> {
+    const r = await this.load();
+    return r.sendRawTx(hex);
+  }
+
   async broadcastBatch(txs: Transaction[]): Promise<string[]> {
     const r = await this.load();
     const txids: string[] = [];
@@ -77,12 +90,28 @@ export class RegtestAdapter implements NetworkAdapter {
     return r.fundWallet(address, amountBsv);
   }
 
+  async fetchUtxos(_address: string): Promise<UTXO[]> {
+    // On regtest, UTXOs are managed by the node wallet via fundWallet
+    return [];
+  }
+
+  async getBalance(_address: string): Promise<number> {
+    const r = await this.load();
+    const bal = r.getBalance(); // BSV as float
+    return Math.round(bal * 1e8);
+  }
+
   async mine(n: number = 1): Promise<void> {
     const r = await this.load();
     r.mine(n);
   }
 
   getTxUrl(_txid: string): string { return ''; }
+
+  async getBlockHeight(): Promise<number> {
+    const r = await this.load();
+    return r.getBlockCount();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,10 +172,12 @@ export class ArcAdapter implements NetworkAdapter {
     throw new Error('ARC broadcast: max retries exceeded');
   }
 
+  async broadcastHex(hex: string): Promise<string> {
+    const tx = Transaction.fromHex(hex);
+    return this.broadcast(tx);
+  }
+
   async broadcastBatch(txs: Transaction[]): Promise<string[]> {
-    // ARC supports batch via POST /v1/txs
-    // Each TX in the batch may depend on the previous one (covenant chain)
-    // Submit them in sequence for safety
     const txids: string[] = [];
     for (const tx of txs) {
       const txid = await this.broadcast(tx);
@@ -159,12 +190,49 @@ export class ArcAdapter implements NetworkAdapter {
     throw new Error(`Cannot auto-fund on ${this.networkType}. Pre-fund the wallet manually.`);
   }
 
+  async fetchUtxos(address: string): Promise<UTXO[]> {
+    const wocBase = this.networkType === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    const resp = await fetch(`${wocBase}/address/${address}/unspent`);
+    if (!resp.ok) throw new Error(`WoC UTXO fetch failed: ${resp.status}`);
+    const data = await resp.json() as any[];
+    return data.map((u: any) => ({
+      txid: u.tx_hash,
+      vout: u.tx_pos,
+      satoshis: u.value,
+      script: '', // caller must fetch TX if needed
+    }));
+  }
+
+  async getBalance(address: string): Promise<number> {
+    const wocBase = this.networkType === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    const resp = await fetch(`${wocBase}/address/${address}/balance`);
+    if (!resp.ok) return 0;
+    const data = await resp.json() as any;
+    return (data.confirmed ?? 0) + (data.unconfirmed ?? 0);
+  }
+
   async mine(_n?: number): Promise<void> {
-    // No-op on testnet/mainnet — TXs confirm via miners
+    // No-op on testnet/mainnet
   }
 
   getTxUrl(txid: string): string {
     return `${WOC_BASE[this.networkType]}/${txid}`;
+  }
+
+  async getBlockHeight(): Promise<number> {
+    try {
+      const wocBase = this.networkType === 'mainnet'
+        ? 'https://api.whatsonchain.com/v1/bsv/main'
+        : 'https://api.whatsonchain.com/v1/bsv/test';
+      const resp = await fetch(`${wocBase}/chain/info`);
+      if (!resp.ok) return 0;
+      const data = await resp.json() as any;
+      return data.blocks ?? 0;
+    } catch { return 0; }
   }
 }
 

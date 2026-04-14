@@ -361,11 +361,13 @@ async function runWorkerInline(
     const result = await executeChainSteps(
       work.molecule, receptor, compiledAsm,
       work.genesisTx, work.genesisTxid,
-      (event: ChainEvent) => {
-        if (event.type === 'step') agent.stats.currentStep = event.step;
-        onEvent(agent, event);
+      {
+        onEvent: (event: ChainEvent) => {
+          if (event.type === 'step') agent.stats.currentStep = event.step;
+          onEvent(agent, event);
+        },
+        stepDelayMs: stepDelay,
       },
-      stepDelay,
     );
 
     let passed = false;

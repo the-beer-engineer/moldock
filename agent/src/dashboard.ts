@@ -26,6 +26,11 @@ export function dashboardHtml(): string {
   .agent-banner .banner-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
   .agent-banner h2 { font-size: 16px; color: #00ff88; }
   .agent-banner .banner-desc { font-size: 11px; color: #88cc88; margin-top: 4px; }
+  .agent-banner .agent-inputs { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  .agent-banner .agent-inputs label { font-size: 11px; color: #88cc88; }
+  .agent-banner .agent-inputs input { background: #050f05; border: 1px solid #1a3a1a; border-radius: 6px; padding: 8px 12px; font-family: inherit; font-size: 13px; color: #e0e0e0; outline: none; width: 180px; }
+  .agent-banner .agent-inputs input:focus { border-color: #00ff88; }
+  .agent-banner .agent-inputs input::placeholder { color: #445; }
   .agent-banner .start-btn { background: #00ff88; color: #0a0a0a; border: none; border-radius: 8px; padding: 12px 28px; font-family: inherit; font-size: 14px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
   .agent-banner .start-btn:hover { background: #33ffaa; transform: scale(1.02); }
   .agent-banner .start-btn:disabled { background: #333; color: #888; cursor: not-allowed; transform: none; }
@@ -57,6 +62,13 @@ export function dashboardHtml(): string {
   .target-bar .target-progress { background: #1a1a1a; border-radius: 4px; height: 20px; overflow: hidden; position: relative; }
   .target-bar .target-fill { background: linear-gradient(90deg, #00ff88, #00cc66); height: 100%; transition: width 1s; position: relative; }
   .target-bar .target-text { position: absolute; right: 8px; top: 2px; font-size: 11px; color: #e0e0e0; font-weight: bold; }
+  .target-bar .target-meta { display: flex; gap: 24px; margin-top: 8px; font-size: 10px; color: #666; flex-wrap: wrap; }
+  .target-bar .target-meta span { white-space: nowrap; }
+  .target-bar .target-meta .warn { color: #ff6644; font-weight: bold; }
+  .target-bar .target-meta .good { color: #00ff88; }
+  .run-status { background: #1a0a0a; border: 1px solid #ff4444; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: none; }
+  .run-status.active { display: block; }
+  .run-status .status-text { font-size: 13px; color: #ff8844; font-weight: bold; }
 
   /* Sections */
   .section { margin-bottom: 16px; }
@@ -102,7 +114,7 @@ export function dashboardHtml(): string {
 </head>
 <body>
 <h1>MolDock Agent Swarm</h1>
-<div class="subtitle">On-chain molecular docking via BSV covenant chains &mdash; AI agents exchange value autonomously</div>
+<div class="subtitle">On-chain molecular docking via BSV covenant chains &mdash; <span id="target-drugs-sub">107</span> FDA-approved drugs vs <span id="target-receptors-sub">8</span> protein targets (CDK2, EGFR, HIV Protease, COVID Mpro, COX-2, ER-alpha, BRAF, AChE)</div>
 <div class="node-status" id="node-status">Node: checking...</div>
 
 <!-- Browser Compute Agent -->
@@ -113,6 +125,16 @@ export function dashboardHtml(): string {
       <div class="banner-desc">Run a compute agent directly in your browser. Earn BSV by verifying molecular docking calculations on-chain.</div>
     </div>
     <button class="start-btn" id="start-btn" onclick="toggleBrowserAgent()">Start Computing</button>
+  </div>
+  <div class="agent-inputs" id="agent-inputs">
+    <div>
+      <label>Agent Name</label><br>
+      <input type="text" id="ba-name" placeholder="e.g. DrugHunter42" maxlength="24" autocomplete="off">
+    </div>
+    <div>
+      <label>HandCash Handle / BSV Address</label><br>
+      <input type="text" id="ba-paymail" placeholder="e.g. $myhandle" maxlength="64" autocomplete="off">
+    </div>
   </div>
   <div class="agent-stats" id="browser-stats" style="display:none">
     <span class="stat">Molecules: <strong id="ba-molecules">0</strong></span>
@@ -131,12 +153,27 @@ export function dashboardHtml(): string {
   <code class="dl-cmd" id="dl-cmd">npx tsx src/computeAgent.ts --server http://localhost:3456 --name MyBot</code>
 </div>
 
+<!-- Run Status Banner (shown when run completes) -->
+<div class="run-status" id="run-status">
+  <span class="status-text" id="run-status-text"></span>
+</div>
+
 <!-- TX Volume Target -->
 <div class="target-bar">
   <div class="target-label">Transaction Volume Target: 1,500,000 TXs in 24h</div>
   <div class="target-progress">
     <div class="target-fill" id="target-fill" style="width:0%"></div>
     <span class="target-text" id="target-text">0 / 1,500,000</span>
+  </div>
+  <div class="target-meta">
+    <span>ETA: <span id="target-eta" class="good">--</span></span>
+    <span>Elapsed: <span id="target-elapsed">--</span></span>
+    <span>Remaining: <span id="target-remaining">--</span></span>
+    <span>Rate: <span id="target-rate" class="good">--</span></span>
+    <span>Avg/mol: <span id="target-avg">--</span> TXs</span>
+    <span>Wallet: <span id="target-wallet">--</span></span>
+    <span>Drugs: <span id="target-drugs">--</span></span>
+    <span>Receptor: <span id="target-receptor">--</span> atoms</span>
   </div>
 </div>
 
@@ -167,13 +204,23 @@ export function dashboardHtml(): string {
   <div class="section">
     <h3>Top Molecules (by score)</h3>
     <table>
-      <thead><tr><th>#</th><th>Molecule</th><th>Score</th><th>Result</th><th>Agent</th><th>TXs</th></tr></thead>
+      <thead><tr><th>#</th><th>Molecule</th><th>Target</th><th>Score</th><th>Result</th><th>Agent</th><th>Chain</th></tr></thead>
       <tbody id="leaderboard"></tbody>
     </table>
   </div>
 </div>
 
-<script>
+<script type="module">
+// Load @bsv/sdk from ESM CDN for in-browser chain building & signing.
+// Falls back gracefully: if CDN is unreachable, browser agent stays disabled.
+let BSV = null;
+try {
+  BSV = await import('https://esm.sh/@bsv/sdk@1.10.1');
+  window.__bsv = BSV;
+} catch (err) {
+  console.warn('[browser-agent] Failed to load @bsv/sdk from CDN:', err);
+}
+
 const $=id=>document.getElementById(id);
 function fmt(ms){if(!ms)return'--';if(ms<1000)return ms.toFixed(0)+'ms';if(ms<60000)return(ms/1000).toFixed(1)+'s';return(ms/60000).toFixed(1)+'m'}
 function fmtBytes(b){if(!b)return'0B';if(b>1048576)return(b/1048576).toFixed(1)+'MB';if(b>1024)return(b/1024).toFixed(0)+'KB';return b+'B'}
@@ -219,10 +266,40 @@ async function refresh(){
     $('tx-sub').textContent = (stats.txsPerSecond||0).toFixed(1) + ' tx/s | ' + fmt(stats.elapsedMs);
 
     // TX volume target bar
-    const TARGET = 1500000;
+    const TARGET = stats.txTarget || 1500000;
     const pct = Math.min(100, totalTxs / TARGET * 100);
     $('target-fill').style.width = pct.toFixed(2) + '%';
-    $('target-text').textContent = totalTxs.toLocaleString() + ' / 1,500,000';
+    $('target-text').textContent = totalTxs.toLocaleString() + ' / ' + TARGET.toLocaleString();
+
+    // Enhanced target meta
+    $('target-rate').textContent = (stats.txsPerSecond||0).toFixed(1) + ' tx/s';
+    $('target-avg').textContent = (stats.avgTxsPerMol || 21).toString();
+    $('target-elapsed').textContent = fmt(stats.elapsedMs);
+    $('target-remaining').textContent = fmt(stats.timeRemainingMs);
+    $('target-eta').textContent = stats.etaMs > 0 ? fmt(stats.etaMs) : '--';
+    $('target-drugs').textContent = (stats.moleculeCount || '--').toString();
+    $('target-receptor').textContent = (stats.receptorAtoms || '--').toString();
+    if (stats.moleculeCount) $('target-drugs-sub').textContent = stats.moleculeCount;
+    if (stats.receptorCount) $('target-receptors-sub').textContent = stats.receptorCount;
+
+    // Wallet balance
+    const walBal = stats.walletBalanceSats || 0;
+    const walEl = $('target-wallet');
+    if (walBal < 5000) {
+      walEl.textContent = walBal.toLocaleString() + ' sats';
+      walEl.className = 'warn';
+    } else {
+      walEl.textContent = (walBal / 100000000).toFixed(4) + ' BSV';
+      walEl.className = 'good';
+    }
+
+    // Run status banner
+    if (stats.stopReason) {
+      $('run-status').className = 'run-status active';
+      $('run-status-text').textContent = 'RUN COMPLETE: ' + stats.stopReason;
+    } else {
+      $('run-status').className = 'run-status';
+    }
 
     const rate = proc > 0 ? ((stats.passed||0)/proc*100).toFixed(0) : '--';
     $('pass-val').textContent = rate + (rate!=='--' ? '%' : '');
@@ -275,7 +352,8 @@ async function refresh(){
     $('leaderboard').innerHTML=sorted.slice(0,25).map((r,i)=>{
       const cls=r.passed?'score good':'score bad';
       const res=r.passed?'<span class="pass">PASS</span>':'<span class="fail">FAIL</span>';
-      return '<tr><td class="rank">#'+(i+1)+'</td><td>'+r.moleculeId+'</td><td class="'+cls+'">'+r.finalScore+'</td><td>'+res+'</td><td style="color:#888">'+(r.agentName||'')+'</td><td>'+r.totalTxs+'</td></tr>';
+      const tgt=(r.receptorName||'').replace(/\s*\(PDB.*\)/,'').slice(0,20);
+      return '<tr><td class="rank">#'+(i+1)+'</td><td>'+r.moleculeId+'</td><td style="color:#00ccff;font-size:9px">'+tgt+'</td><td class="'+cls+'">'+r.finalScore+'</td><td>'+res+'</td><td style="color:#888">'+(r.agentName||'')+'</td><td>'+r.chainSteps+' steps</td></tr>';
     }).join('');
 
   }catch(e){console.error('refresh',e)}
@@ -283,14 +361,23 @@ async function refresh(){
 setInterval(refresh,500);
 refresh();
 
+// Expose entry points for inline onclick handlers (module scope doesn't leak to window automatically).
+window.toggleBrowserAgent = (...args) => toggleBrowserAgent(...args);
+
 // ========== Browser Compute Agent ==========
 // Runs entirely client-side: fetches work from dispatch, computes energy,
 // submits results. No @bsv/sdk needed in browser — energy.ts is pure math.
 
 let browserAgentRunning = false;
 let browserAgentId = null;
+let browserPrivKey = null;   // BSV PrivateKey instance
+let browserPubKeyHex = null; // 33-byte compressed pubkey hex
+let browserNetwork = 'regtest';
+let browserArc = null;       // BSV.ARC instance when network != regtest
 let baStats = { molecules: 0, passed: 0, failed: 0, txs: 0, earned: 0 };
 const baScoreHistory = [];
+const baBodyHexCache = new Map();
+let baBackoffUntil = 0;      // monotonic wall-clock ms; broadcast pauses while now() < this
 
 function baLog(msg, color) {
   const log = $('browser-log');
@@ -319,8 +406,40 @@ async function toggleBrowserAgent() {
     browserAgentRunning = false;
     $('start-btn').textContent = 'Start Computing';
     $('start-btn').className = 'start-btn';
+    $('agent-inputs').style.display = 'flex';
     $('ba-status').textContent = 'stopped';
     baLog('Agent stopped.', '#ff6644');
+    return;
+  }
+
+  // Validate inputs
+  const nameInput = $('ba-name');
+  const paymailInput = $('ba-paymail');
+  let agentName = (nameInput.value || '').trim();
+  const paymail = (paymailInput.value || '').trim() || null;
+
+  if (!agentName) {
+    nameInput.style.borderColor = '#ff4444';
+    nameInput.focus();
+    return;
+  }
+  nameInput.style.borderColor = '#1a3a1a';
+
+  // Check name availability
+  try {
+    const check = await fetch('/api/agent/check-name/' + encodeURIComponent(agentName)).then(r => r.json());
+    if (!check.available) {
+      nameInput.style.borderColor = '#ff4444';
+      baLog('Name "' + agentName + '" is already taken. Choose another.', '#ff4444');
+      $('browser-log').style.display = 'block';
+      nameInput.focus();
+      return;
+    }
+  } catch {}
+
+  if (!BSV) {
+    baLog('BSV SDK failed to load from CDN. Browser agent unavailable.', '#ff4444');
+    $('browser-log').style.display = 'block';
     return;
   }
 
@@ -328,20 +447,46 @@ async function toggleBrowserAgent() {
   browserAgentRunning = true;
   $('start-btn').textContent = 'Stop';
   $('start-btn').className = 'stop-btn';
+  $('agent-inputs').style.display = 'none';
   $('browser-stats').style.display = 'flex';
   $('browser-log').style.display = 'block';
   $('ba-status').textContent = 'starting...';
 
-  // Generate random agent name
-  const agentName = 'Browser-' + Math.random().toString(36).slice(2, 6);
-  baLog('Starting as ' + agentName + '...', '#00ccff');
+  // Generate session keypair
+  browserPrivKey = BSV.PrivateKey.fromRandom();
+  browserPubKeyHex = browserPrivKey.toPublicKey().toString();
+  baLog('Generated session keypair: ' + browserPubKeyHex.slice(0, 16) + '...', '#88cc88');
+
+  // Discover network mode — determines whether browser uses /api/broadcast forwarder or ARC direct
+  try {
+    const disc = await fetch('/api/discover').then(r => r.json());
+    browserNetwork = disc.network || 'regtest';
+    baLog('Discovered dispatch on ' + browserNetwork, '#88cc88');
+    if (browserNetwork !== 'regtest' && BSV.ARC) {
+      // ARC-lock: on testnet/mainnet broadcast direct to ARC, bypass dispatch forwarder.
+      const arcUrl = browserNetwork === 'mainnet'
+        ? 'https://arcade-us-1.bsvb.tech/'
+        : 'https://arcade-ttn-us-1.bsvb.tech/';
+      try {
+        browserArc = new BSV.ARC(arcUrl);
+        baLog('ARC direct broadcast enabled: ' + arcUrl, '#00ff88');
+      } catch (e) {
+        baLog('ARC init failed, falling back to dispatch forwarder: ' + e.message, '#ffaa00');
+        browserArc = null;
+      }
+    }
+  } catch (e) {
+    baLog('Discover failed: ' + e.message, '#ff6644');
+  }
+
+  baLog('Starting as ' + agentName + (paymail ? ' (' + paymail + ')' : '') + '...', '#00ccff');
 
   try {
     // Register
     const regRes = await fetch('/api/agent/register', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ name: agentName, pubkey: '0'.repeat(66), paymail: null }),
+      body: JSON.stringify({ name: agentName, pubkey: browserPubKeyHex, paymail: paymail }),
     }).then(r => r.json());
 
     if (regRes.error) { baLog('Registration failed: ' + regRes.error, '#ff4444'); browserAgentRunning = false; return; }
@@ -358,68 +503,171 @@ async function toggleBrowserAgent() {
   }
 }
 
+// Fetch + compute + build for one work item. Returns null if no work is available.
+// seed can be a pre-fetched work object (from a previous pass/fail response) to skip /work.
+async function prepareNextWork(seed) {
+  let work = seed || null;
+  if (!work) {
+    const workRes = await fetch('/api/agent/' + browserAgentId + '/work').then(r => r.json());
+    if (workRes.error || !workRes.work) return null;
+    work = workRes.work;
+  }
+  const tCompute = performance.now();
+  const stepBatches = [];
+  let totalScore = 0;
+  for (const rAtom of work.receptor.atoms) {
+    const batch = computeBatchEnergyBrowser(work.molecule.atoms, rAtom);
+    stepBatches.push(batch);
+    totalScore += batch.batchTotal;
+  }
+  const computeMs = (performance.now() - tCompute).toFixed(0);
+  const passed = baIsPassing(totalScore);
+  let chain = null;
+  let buildMs = '0';
+  if (passed) {
+    const tBuild = performance.now();
+    chain = buildChainBrowser(work, stepBatches);
+    buildMs = (performance.now() - tBuild).toFixed(0);
+  }
+  return { work, stepBatches, totalScore, passed, chain, computeMs, buildMs };
+}
+
+// Broadcast step TXs honoring the backoff clock + ARC lock.
+// When browserArc is set (testnet/mainnet) goes direct-to-ARC; otherwise uses dispatch forwarder.
+async function broadcastChainBrowser(stepTxHexes) {
+  // Respect backoff from previous "too-long-mempool-chain" style errors.
+  const wait = baBackoffUntil - Date.now();
+  if (wait > 0) {
+    $('ba-status').textContent = 'backoff ' + (wait/1000).toFixed(1) + 's...';
+    await new Promise(r => setTimeout(r, wait));
+  }
+
+  if (browserArc) {
+    // ARC-direct path: broadcast each step TX via BSV.ARC instance.
+    for (let i = 0; i < stepTxHexes.length; i++) {
+      try {
+        const tx = BSV.Transaction.fromHex(stepTxHexes[i]);
+        const res = await browserArc.broadcast(tx);
+        if (res && res.status && res.status >= 400) {
+          return { ok: false, error: 'arc step ' + i + ': ' + (res.description || res.status) };
+        }
+      } catch (e) {
+        const msg = String(e && e.message || e);
+        if (/too.long.mempool.chain|mempool.full|chain.too.long|limit.?ancestor|limit.?descendant/i.test(msg)) {
+          baBackoffUntil = Date.now() + 3500;
+        }
+        return { ok: false, error: 'arc step ' + i + ': ' + msg };
+      }
+    }
+    return { ok: true };
+  }
+
+  // Regtest path: /api/broadcast forwarder (batch).
+  const bcastRes = await fetch('/api/broadcast', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ txHexes: stepTxHexes }),
+  }).then(r => r.json());
+  if (!bcastRes.ok && bcastRes.backoff) {
+    baBackoffUntil = Date.now() + 3500;
+  }
+  return bcastRes;
+}
+
 async function browserWorkLoop() {
+  // Prefetch pipeline: while we broadcast molecule N, we already fetch+compute+build molecule N+1.
+  let nextPrepPromise = prepareNextWork(null);
+
   while (browserAgentRunning) {
     try {
-      $('ba-status').textContent = 'requesting work...';
-      const workRes = await fetch('/api/agent/' + browserAgentId + '/work').then(r => r.json());
-      if (workRes.error) {
+      $('ba-status').textContent = 'waiting for prep...';
+      const prep = await nextPrepPromise;
+      nextPrepPromise = null;
+
+      if (!prep) {
         $('ba-status').textContent = 'waiting...';
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 1500));
+        nextPrepPromise = prepareNextWork(null);
         continue;
       }
 
-      const work = workRes.work;
+      const { work, totalScore, passed, chain, computeMs, buildMs } = prep;
       const molId = work.molecule.id;
-      const numAtoms = work.molecule.atoms.length;
-      const numSteps = work.numSteps;
       $('ba-status').textContent = molId.slice(0, 20) + '...';
-      baLog('Computing: ' + molId + ' (' + numAtoms + ' atoms x ' + numSteps + ' steps)');
-
-      // Compute energy (pure math, no BSV SDK needed)
-      const t0 = performance.now();
-      let totalScore = 0;
-      for (const rAtom of work.receptor.atoms) {
-        const batch = computeBatchEnergyBrowser(work.molecule.atoms, rAtom);
-        totalScore += batch.batchTotal;
-      }
-      const elapsed = (performance.now() - t0).toFixed(0);
 
       baStats.molecules++;
-      baStats.txs += numSteps + 1;
 
-      const passed = baIsPassing(totalScore);
-
-      if (passed) {
-        baStats.passed++;
-        baLog('PASS score=' + totalScore + ' (' + elapsed + 'ms)', '#00ff88');
-
-        // Submit pass (no chain TXs in browser — dispatch handles broadcasting)
-        const passRes = await fetch('/api/agent/' + browserAgentId + '/pass', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ workId: work.id, finalScore: totalScore, chainTxHexes: [] }),
-        }).then(r => r.json());
-
-        if (passRes.ok) {
-          const reward = 100 + (10 * numSteps);
-          baStats.earned += 100; // dispatch pays 100 sats per work
-          // Confirm
-          await fetch('/api/agent/' + browserAgentId + '/confirm', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ workId: work.id, txids: [] }),
-          });
-        }
-      } else {
+      if (!passed) {
         baStats.failed++;
-        baLog('FAIL score=' + totalScore + ' (' + elapsed + 'ms)', '#ff6644');
-        await fetch('/api/agent/' + browserAgentId + '/fail', {
+        baLog('FAIL ' + molId + ' score=' + totalScore + ' (' + computeMs + 'ms)', '#ff6644');
+        const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ workId: work.id, finalScore: totalScore }),
-        });
-        baStats.earned += 100;
+        }).then(r => r.json());
+        nextPrepPromise = prepareNextWork(failRes.nextWork || null);
+        baUpdateStats();
+        continue;
+      }
+
+      // PASS: broadcast step TXs (skip genesis index 0 — dispatch already broadcast it)
+      // while concurrently kicking off prep for the NEXT molecule.
+      $('ba-status').textContent = 'broadcasting...';
+      const t2 = performance.now();
+      const stepTxHexes = chain.txHexes.slice(1);
+
+      // Start next prep in parallel with broadcast.
+      nextPrepPromise = prepareNextWork(null);
+
+      const bcastRes = await broadcastChainBrowser(stepTxHexes);
+      const bcastMs = (performance.now() - t2).toFixed(0);
+
+      if (!bcastRes.ok) {
+        const errMsg = bcastRes.errors && bcastRes.errors.length
+          ? 'step ' + bcastRes.errors[0].index + ': ' + bcastRes.errors[0].error
+          : (bcastRes.error || 'unknown');
+        baLog('Broadcast failed: ' + errMsg, '#ff4444');
+        const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ workId: work.id, finalScore: totalScore }),
+        }).then(r => r.json());
+        if (failRes.nextWork) {
+          // Override the already-started prep with the seeded one for fairness.
+          nextPrepPromise = prepareNextWork(failRes.nextWork);
+        }
+        baUpdateStats();
+        continue;
+      }
+
+      baStats.txs += chain.txHexes.length;
+      baStats.passed++;
+      baLog('PASS ' + molId + ' score=' + totalScore + ' compute=' + computeMs + 'ms build=' + buildMs + 'ms bcast=' + bcastMs + 'ms ' + chain.txHexes.length + ' TXs', '#00ff88');
+
+      // Deliver FULL chainTxHexes (including genesis) back to dispatch so it can
+      // re-broadcast any TX the node drops. Trust layer.
+      const passRes = await fetch('/api/agent/' + browserAgentId + '/pass', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          workId: work.id,
+          finalScore: totalScore,
+          chainTxHexes: chain.txHexes,
+          alreadyBroadcast: true,
+        }),
+      }).then(r => r.json());
+
+      if (passRes.ok) {
+        baStats.earned += (passRes.reward || 100);
+        // Confirm txids for trust accounting. Don't override nextPrepPromise here —
+        // we already started it in parallel above.
+        fetch('/api/agent/' + browserAgentId + '/confirm', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ workId: work.id, txids: chain.stepTxids }),
+        }).catch(() => {});
+      } else if (passRes.error) {
+        baLog('Pass rejected: ' + passRes.error, '#ff4444');
       }
 
       baUpdateStats();
@@ -428,42 +676,206 @@ async function browserWorkLoop() {
     } catch (err) {
       baLog('Error: ' + err.message, '#ff4444');
       await new Promise(r => setTimeout(r, 3000));
+      if (!nextPrepPromise) nextPrepPromise = prepareNextWork(null);
     }
   }
 }
 
-// ========== Browser Energy Computation ==========
-// Pure JavaScript port of energy.ts — runs in any browser, no dependencies.
+// ========== Chain Building (browser port of computeAgent.ts) ==========
 
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i*2, 2), 16);
+  return out;
+}
+function bytesToHex(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, '0');
+  return s;
+}
+
+function pushData(data) {
+  // data is number[] or Uint8Array
+  const arr = Array.from(data);
+  if (arr.length === 0) return [0x00];
+  if (arr.length === 1 && arr[0] >= 1 && arr[0] <= 16) return [0x50 + arr[0]];
+  if (arr.length === 1 && arr[0] === 0x81) return [0x4f];
+  if (arr.length <= 75) return [arr.length, ...arr];
+  if (arr.length <= 255) return [0x4c, arr.length, ...arr];
+  return [0x4d, arr.length & 0xff, (arr.length >> 8) & 0xff, ...arr];
+}
+
+function pushScriptNum(n) {
+  if (n === 0) return [0x00];
+  if (n === -1) return [0x4f];
+  if (n >= 1 && n <= 16) return [0x50 + n];
+  const neg = n < 0;
+  let abs = Math.abs(n);
+  const bytes = [];
+  while (abs > 0) { bytes.push(abs & 0xff); abs = Math.floor(abs / 256); }
+  if (bytes[bytes.length - 1] & 0x80) bytes.push(neg ? 0x80 : 0x00);
+  else if (neg) bytes[bytes.length - 1] |= 0x80;
+  return pushData(bytes);
+}
+
+function buildChainScriptSigBrowser(prevTxid, inputSats, batchTotal, scoreOut, pairs) {
+  const parts = [];
+  // txid in little-endian
+  const txidBytes = Array.from(hexToBytes(prevTxid)).reverse();
+  parts.push(pushData(txidBytes));
+  // 8-byte LE sats
+  const satsBytes = [];
+  let s = BigInt(inputSats);
+  for (let i = 0; i < 8; i++) { satsBytes.push(Number(s & 0xffn)); s >>= 8n; }
+  parts.push(pushData(satsBytes));
+  parts.push(pushScriptNum(batchTotal));
+  parts.push(pushScriptNum(scoreOut));
+  for (const pair of pairs) {
+    parts.push(pushScriptNum(pair.hbond));
+    parts.push(pushScriptNum(pair.elec));
+    parts.push(pushScriptNum(pair.vdw));
+    parts.push(pushScriptNum(pair.dist));
+    parts.push(pushScriptNum(pair.dsq));
+  }
+  // concat
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return bytesToHex(out);
+}
+
+function buildChainLockScriptBrowser(numAtoms, score, compiledAsm) {
+  let cachedBodyHex = baBodyHexCache.get(compiledAsm);
+  if (!cachedBodyHex) {
+    const parts = compiledAsm.split('OP_DROP ');
+    if (parts.length < 2) throw new Error('Could not find OP_DROP in compiled chain ASM');
+    const bodyAsm = parts.slice(1).join('OP_DROP ');
+    cachedBodyHex = BSV.Script.fromASM(bodyAsm).toHex();
+    baBodyHexCache.set(compiledAsm, cachedBodyHex);
+  }
+
+  // 4-byte LE score prefix
+  const buf = new Uint8Array(4);
+  if (score !== 0) {
+    const neg = score < 0;
+    let abs = Math.abs(score);
+    buf[0] = abs & 0xff;
+    buf[1] = (abs >> 8) & 0xff;
+    buf[2] = (abs >> 16) & 0xff;
+    buf[3] = (Math.floor(abs / 0x1000000)) & 0xff;
+    if (neg) buf[3] |= 0x80;
+  }
+  const scorePrefix = '04' + bytesToHex(buf);
+  const fullHex = scorePrefix + '75' + cachedBodyHex;
+  const rawBytes = hexToBytes(fullHex);
+  return new BSV.Script([], rawBytes, undefined, false);
+}
+
+function buildChainBrowser(work, stepBatches) {
+  const { Transaction, Script } = BSV;
+  const numAtoms = work.molecule.atoms.length;
+  const numSteps = work.numSteps;
+  const compiledAsm = work.compiledAsm;
+
+  const genesisTx = Transaction.fromHex(work.genesisTxHex);
+  const genesisTxid = work.genesisTxid;
+
+  const txHexes = [genesisTx.toHex()];
+  const stepTxids = [];
+
+  let prevTx = genesisTx;
+  let currentTxid = genesisTxid;
+  let currentScore = 0;
+
+  for (let step = 0; step < numSteps; step++) {
+    const batch = stepBatches[step];
+    const newScore = currentScore + batch.batchTotal;
+    const scriptSigHex = buildChainScriptSigBrowser(currentTxid, 1, batch.batchTotal, newScore, batch.pairs);
+
+    const chainTx = new Transaction();
+    chainTx.version = 2;
+    chainTx.lockTime = 0;
+    chainTx.addInput({
+      sourceTransaction: prevTx,
+      sourceOutputIndex: 0,
+      unlockingScript: Script.fromHex(scriptSigHex),
+      sequence: 0xffffffff,
+    });
+    chainTx.addOutput({
+      lockingScript: buildChainLockScriptBrowser(numAtoms, newScore, compiledAsm),
+      satoshis: 1,
+    });
+
+    txHexes.push(chainTx.toHex());
+    const txid = chainTx.id('hex');
+    stepTxids.push(txid);
+
+    prevTx = chainTx;
+    currentTxid = txid;
+    currentScore = newScore;
+  }
+
+  return { txHexes, stepTxids, finalScore: currentScore };
+}
+
+// ========== Browser Energy Computation ==========
+// Pure JavaScript port of energy.ts — MUST MATCH EXACTLY for spot-check to pass.
+
+const VDW_RADIUS_BA = {1:170,2:155,3:152,4:180,5:120,6:180,7:147,8:175};
+const VDW_EPSILON_BA = {1:150,2:200,3:210,4:250,5:50,6:200,7:180,8:300};
+const HBOND_TYPES_BA = new Set([2,3,4]);
+
+function computeDsqBa(l, r) {
+  const dx = l.x - r.x, dy = l.y - r.y, dz = l.z - r.z;
+  return dx*dx + dy*dy + dz*dz;
+}
+function computeIsqrtBa(dsq) {
+  if (dsq <= 0) return 0;
+  const dist = Math.floor(Math.sqrt(dsq));
+  if (dist * dist > dsq) return dist - 1;
+  if ((dist + 1) * (dist + 1) <= dsq) return dist + 1;
+  return dist;
+}
+function computeVdwBa(dist, typeL, typeR) {
+  const sigma = (VDW_RADIUS_BA[typeL] || 170) + (VDW_RADIUS_BA[typeR] || 170);
+  const eps = Math.floor(((VDW_EPSILON_BA[typeL] || 150) + (VDW_EPSILON_BA[typeR] || 150)) / 2);
+  if (dist <= 0) return 0;
+  const ratio100 = Math.floor((sigma * 100) / dist);
+  const ratio = ratio100 / 100;
+  const r6 = Math.pow(ratio, 6);
+  const r12 = r6 * r6;
+  const lj = eps * (r12 - 2 * r6);
+  return Math.max(-10000, Math.min(10000, Math.round(lj)));
+}
+function computeElecBa(dist, chargeL, chargeR) {
+  if (dist <= 0) return 0;
+  const q = chargeL * chargeR;
+  const denom = 4 * dist * dist;
+  if (denom === 0) return 0;
+  const raw = Math.round((332 * q) / (denom * 100));
+  return Math.max(-5000, Math.min(5000, raw));
+}
+function computeHbondBa(dist, typeL, typeR) {
+  if (!HBOND_TYPES_BA.has(typeL) || !HBOND_TYPES_BA.has(typeR)) return 0;
+  if (dist < 200 || dist > 400) return 0;
+  const optimal = 300;
+  const deviation = Math.abs(dist - optimal);
+  const maxDev = 120;
+  if (deviation >= maxDev) return 0;
+  const score = Math.round(500 * (1 - deviation / maxDev));
+  return -score;
+}
 function computeBatchEnergyBrowser(ligandAtoms, receptorAtom) {
   const pairs = [];
   let batchTotal = 0;
-  for (const lAtom of ligandAtoms) {
-    const dx = lAtom.x - receptorAtom.x;
-    const dy = lAtom.y - receptorAtom.y;
-    const dz = lAtom.z - receptorAtom.z;
-    const dsq = dx * dx + dy * dy + dz * dz;
-
-    // isqrt approximation (matching on-chain Script)
-    let dist = 0;
-    if (dsq > 0) {
-      let x = dsq;
-      let y = (x + 1) >> 1;
-      while (y < x) { x = y; y = (x + Math.floor(dsq / x)) >> 1; }
-      dist = x;
-    }
-
-    // van der Waals
-    const vdw = dist > 0 ? Math.floor(10000 / (dist * dist)) : 10000;
-
-    // Electrostatic
-    const q1 = lAtom.charge || 0;
-    const q2 = receptorAtom.charge || 0;
-    const elec = dist > 0 ? Math.floor((q1 * q2) / dist) : 0;
-
-    // H-bond
-    const hbond = (lAtom.type === receptorAtom.type && dist < 350) ? -500 : 0;
-
+  for (const la of ligandAtoms) {
+    const dsq = computeDsqBa(la, receptorAtom);
+    const dist = computeIsqrtBa(dsq);
+    const vdw = computeVdwBa(dist, la.type, receptorAtom.type);
+    const elec = computeElecBa(dist, la.charge, receptorAtom.charge);
+    const hbond = computeHbondBa(dist, la.type, receptorAtom.type);
     const total = vdw + elec + hbond;
     batchTotal += total;
     pairs.push({ dsq, dist, vdw, elec, hbond, total });

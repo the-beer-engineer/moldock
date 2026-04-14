@@ -38,19 +38,58 @@ export function generateReceptorSite(numAtoms: number): ReceptorSite {
 }
 
 // --- Real molecule library ---
-interface LibraryData {
+
+/** Raw JSON shape: single-receptor (old) format */
+interface OldLibraryData {
   receptor: ReceptorSite;
   molecules: Array<Molecule & { active?: boolean; category?: string }>;
 }
 
+/** Raw JSON shape: multi-receptor (new) format */
+interface NewLibraryData {
+  receptors: ReceptorSite[];
+  molecules: Array<Molecule & { active?: boolean; category?: string; receptorId?: string }>;
+}
+
+/** Normalized internal representation — always multi-receptor */
+interface LibraryData {
+  receptors: Map<string, ReceptorSite>;
+  molecules: Array<Molecule & { active?: boolean; category?: string; receptorId?: string }>;
+}
+
 let cachedLibrary: LibraryData | null = null;
 
-/** Load the real molecule library (downloaded from PubChem) */
+/** Load the real molecule library (downloaded from PubChem).
+ *  Tries the new multi-receptor `data/library.json` first,
+ *  falls back to old single-receptor `data/cdk2/library.json`. */
 export function loadRealLibrary(): LibraryData | null {
   if (cachedLibrary) return cachedLibrary;
-  const libPath = new URL('../data/cdk2/library.json', import.meta.url);
+
+  // Try new multi-receptor format first
+  const newLibPath = new URL('../data/library.json', import.meta.url);
   try {
-    cachedLibrary = JSON.parse(readFileSync(libPath, 'utf-8'));
+    const raw: NewLibraryData = JSON.parse(readFileSync(newLibPath, 'utf-8'));
+    if (raw.receptors && Array.isArray(raw.receptors)) {
+      const receptors = new Map<string, ReceptorSite>();
+      for (const r of raw.receptors) {
+        receptors.set(r.id, r);
+      }
+      cachedLibrary = { receptors, molecules: raw.molecules };
+      return cachedLibrary;
+    }
+  } catch {
+    // new format not available — fall through
+  }
+
+  // Fall back to old single-receptor format
+  const oldLibPath = new URL('../data/cdk2/library.json', import.meta.url);
+  try {
+    const raw: OldLibraryData = JSON.parse(readFileSync(oldLibPath, 'utf-8'));
+    const receptors = new Map<string, ReceptorSite>();
+    receptors.set(raw.receptor.id, raw.receptor);
+    // Tag all molecules with the single receptor's ID
+    const molecules = raw.molecules.map(m => ({ ...m, receptorId: raw.receptor.id }));
+    cachedLibrary = { receptors, molecules };
     return cachedLibrary;
   } catch {
     return null;
@@ -59,19 +98,21 @@ export function loadRealLibrary(): LibraryData | null {
 
 /** Get real molecules for docking. Returns numMolecules molecules from the
  *  library, cycling through if more are needed. Each cycle adds a small
- *  random perturbation to create unique conformations. */
-export function getRealMolecules(numMolecules: number): { molecules: Molecule[]; receptor: ReceptorSite } {
+ *  random perturbation to create unique conformations.
+ *
+ *  Multi-receptor: each molecule carries its `receptorId` and the `receptors`
+ *  map contains all binding sites. `receptor` returns the first for backward compat. */
+export function getRealMolecules(numMolecules: number): {
+  molecules: Array<Molecule & { receptorId?: string }>;
+  receptors: Map<string, ReceptorSite>;
+  receptor: ReceptorSite; // backward compat — first receptor
+} {
   const lib = loadRealLibrary();
   if (!lib) {
-    // Fallback to synthetic
-    console.warn('[generate] No real library found, using synthetic molecules');
-    return {
-      molecules: Array.from({ length: numMolecules }, () => generateMolecule(5)),
-      receptor: generateReceptorSite(8),
-    };
+    throw new Error('[generate] Real drug library not found! Run: npx tsx src/realMolecules.ts to download from PubChem. Synthetic fallback disabled for production.');
   }
 
-  const molecules: Molecule[] = [];
+  const molecules: Array<Molecule & { receptorId?: string }> = [];
   for (let i = 0; i < numMolecules; i++) {
     const baseMol = lib.molecules[i % lib.molecules.length];
     if (i < lib.molecules.length) {
@@ -93,7 +134,10 @@ export function getRealMolecules(numMolecules: number): { molecules: Molecule[];
     }
   }
 
-  return { molecules, receptor: lib.receptor };
+  // First receptor for backward compat
+  const firstReceptor = lib.receptors.values().next().value!;
+
+  return { molecules, receptors: lib.receptors, receptor: firstReceptor };
 }
 
 // CLI: generate test data (only runs when executed directly)

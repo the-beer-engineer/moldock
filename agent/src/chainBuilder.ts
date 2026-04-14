@@ -1,7 +1,7 @@
 import { Transaction, P2PKH, Script, LockingScript, SatoshisPerKilobyte } from '@bsv/sdk';
 import { Wallet } from './wallet.js';
 import type { UTXO } from './wallet.js';
-import * as regtest from './regtest.js';
+import { getNetwork } from './network.js';
 import { generateChainSx } from './chainTemplate.js';
 import { compileSxToLockHex, buildChainLockScript } from './genesis.js';
 import { computeBatchEnergy } from './energy.js';
@@ -120,73 +120,151 @@ export type FundingUtxo = {
   txid: string; vout: number; satoshis: number; script: string; sourceTransaction: Transaction;
 };
 
-// --- Fund a wallet from regtest node (single UTXO) ---
+// --- Fund a wallet (regtest: from node, mainnet: uses existing UTXOs) ---
 export async function fundWalletP2PK(wallet: Wallet, amountBsv: number = 0.05): Promise<FundingUtxo> {
-  const p2pkhUtxo = regtest.fundWallet(wallet.address, amountBsv);
-  const tx = new Transaction();
-  tx.addInput({
-    sourceTransaction: p2pkhUtxo.sourceTransaction,
-    sourceOutputIndex: p2pkhUtxo.vout,
-    unlockingScriptTemplate: new P2PKH().unlock(
-      wallet.privateKey, 'all', false,
-      p2pkhUtxo.satoshis, Script.fromHex(p2pkhUtxo.script),
-    ),
-  });
-  tx.addOutput({ lockingScript: wallet.p2pkLockingScript(), change: true });
-  await tx.fee(new SatoshisPerKilobyte(config.feePerKb));
-  await tx.sign();
-  const txid = regtest.broadcastAndMine(tx);
+  const net = getNetwork();
+
+  if (net.getNetwork() === 'regtest') {
+    const regtest = await import('./regtest.js');
+    const p2pkhUtxo = regtest.fundWallet(wallet.address, amountBsv);
+    const tx = new Transaction();
+    tx.addInput({
+      sourceTransaction: p2pkhUtxo.sourceTransaction,
+      sourceOutputIndex: p2pkhUtxo.vout,
+      unlockingScriptTemplate: new P2PKH().unlock(
+        wallet.privateKey, 'all', false,
+        p2pkhUtxo.satoshis, Script.fromHex(p2pkhUtxo.script),
+      ),
+    });
+    tx.addOutput({ lockingScript: wallet.p2pkLockingScript(), change: true });
+    await tx.fee(new SatoshisPerKilobyte(config.feePerKb));
+    await tx.sign();
+    const txid = regtest.broadcastAndMine(tx);
+    return {
+      txid, vout: 0, satoshis: tx.outputs[0].satoshis!,
+      script: wallet.p2pkLockingScript().toHex(),
+      sourceTransaction: Transaction.fromHex(regtest.getRawTx(txid)),
+    };
+  }
+
+  // Mainnet/testnet: return largest UTXO from wallet
+  const utxos = wallet.getUtxos();
+  if (utxos.length === 0) throw new Error('No UTXOs. Fund wallet: ' + wallet.address);
+  const best = [...utxos].sort((a, b) => b.satoshis - a.satoshis)[0];
   return {
-    txid,
-    vout: 0,
-    satoshis: tx.outputs[0].satoshis!,
-    script: wallet.p2pkLockingScript().toHex(),
-    sourceTransaction: Transaction.fromHex(regtest.getRawTx(txid)),
+    txid: best.txid, vout: best.vout, satoshis: best.satoshis,
+    script: best.script, sourceTransaction: best.sourceTransaction!,
   };
 }
 
 // --- Bulk fund: create many P2PK UTXOs in one TX ---
+// On regtest: funds from node wallet. On mainnet/testnet: uses wallet's own UTXOs.
 export async function bulkFundWalletP2PK(
   wallet: Wallet,
   count: number,
   satsPerUtxo: number = 10000,
 ): Promise<FundingUtxo[]> {
-  // Get enough coins from regtest node
+  const net = getNetwork();
   const totalNeeded = count * satsPerUtxo + 10000; // extra for fees
-  const amountBsv = parseFloat((totalNeeded / 1e8 + 0.01).toFixed(8));
-  const p2pkhUtxo = regtest.fundWallet(wallet.address, amountBsv);
 
-  // Build a fan-out TX: 1 P2PKH input → N P2PK outputs
+  if (net.getNetwork() === 'regtest') {
+    // Regtest: fund from node coinbase wallet
+    const regtest = await import('./regtest.js');
+    const amountBsv = parseFloat((totalNeeded / 1e8 + 0.01).toFixed(8));
+    const p2pkhUtxo = regtest.fundWallet(wallet.address, amountBsv);
+
+    const tx = new Transaction();
+    tx.addInput({
+      sourceTransaction: p2pkhUtxo.sourceTransaction,
+      sourceOutputIndex: p2pkhUtxo.vout,
+      unlockingScriptTemplate: new P2PKH().unlock(
+        wallet.privateKey, 'all', false,
+        p2pkhUtxo.satoshis, Script.fromHex(p2pkhUtxo.script),
+      ),
+    });
+
+    const lockScript = wallet.p2pkLockingScript();
+    for (let i = 0; i < count; i++) {
+      tx.addOutput({ lockingScript: lockScript, satoshis: satsPerUtxo });
+    }
+    tx.addOutput({ lockingScript: lockScript, change: true });
+    await tx.fee(new SatoshisPerKilobyte(config.feePerKb));
+    await tx.sign();
+
+    const txid = regtest.broadcastAndMine(tx);
+    const sourceTx = Transaction.fromHex(regtest.getRawTx(txid));
+    const scriptHex = lockScript.toHex();
+
+    return Array.from({ length: count }, (_, i) => ({
+      txid, vout: i, satoshis: satsPerUtxo, script: scriptHex, sourceTransaction: sourceTx,
+    }));
+  }
+
+  // Mainnet/testnet: use wallet's own UTXOs
+  let utxos = wallet.getUtxos();
+  if (utxos.length === 0) {
+    // Fetch UTXOs from WoC
+    const wocUtxos = await net.fetchUtxos(wallet.address);
+    for (const u of wocUtxos) {
+      // Fetch the source TX for spending
+      const wocBase = net.getNetwork() === 'mainnet'
+        ? 'https://api.whatsonchain.com/v1/bsv/main'
+        : 'https://api.whatsonchain.com/v1/bsv/test';
+      const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
+      if (!resp.ok) continue;
+      const txHex = await resp.text();
+      wallet.addUtxo({
+        txid: u.txid,
+        vout: u.vout,
+        satoshis: u.satoshis,
+        script: wallet.p2pkLockingScript().toHex(),
+        sourceTransaction: Transaction.fromHex(txHex),
+      });
+    }
+    utxos = wallet.getUtxos();
+  }
+
+  if (utxos.length === 0) throw new Error('No UTXOs available. Fund the wallet first: ' + wallet.address);
+
+  // Find a UTXO large enough, or combine multiple
+  const sortedUtxos = [...utxos].sort((a, b) => b.satoshis - a.satoshis);
+  const utxo = sortedUtxos[0];
+  if (utxo.satoshis < totalNeeded) {
+    throw new Error(`Largest UTXO (${utxo.satoshis} sats) too small. Need ${totalNeeded} sats.`);
+  }
+
+  // Build fan-out TX
   const tx = new Transaction();
   tx.addInput({
-    sourceTransaction: p2pkhUtxo.sourceTransaction,
-    sourceOutputIndex: p2pkhUtxo.vout,
-    unlockingScriptTemplate: new P2PKH().unlock(
-      wallet.privateKey, 'all', false,
-      p2pkhUtxo.satoshis, Script.fromHex(p2pkhUtxo.script),
-    ),
+    sourceTransaction: utxo.sourceTransaction,
+    sourceOutputIndex: utxo.vout,
+    unlockingScriptTemplate: wallet.p2pkUnlock(utxo.satoshis, Script.fromHex(utxo.script)),
   });
 
   const lockScript = wallet.p2pkLockingScript();
   for (let i = 0; i < count; i++) {
     tx.addOutput({ lockingScript: lockScript, satoshis: satsPerUtxo });
   }
-  // Change
   tx.addOutput({ lockingScript: lockScript, change: true });
-
   await tx.fee(new SatoshisPerKilobyte(config.feePerKb));
   await tx.sign();
 
-  const txid = regtest.broadcastAndMine(tx);
-  const sourceTx = Transaction.fromHex(regtest.getRawTx(txid));
-  const scriptHex = lockScript.toHex();
+  const txid = await net.broadcast(tx);
+  wallet.spendUtxo(utxo.txid, utxo.vout);
 
+  // Track change output as new UTXO
+  const changeIdx = count; // change is output after all funded outputs
+  const changeSats = tx.outputs[changeIdx]?.satoshis;
+  if (changeSats && changeSats > 0) {
+    wallet.addUtxo({
+      txid, vout: changeIdx, satoshis: changeSats,
+      script: lockScript.toHex(), sourceTransaction: tx,
+    });
+  }
+
+  const scriptHex = lockScript.toHex();
   return Array.from({ length: count }, (_, i) => ({
-    txid,
-    vout: i,
-    satoshis: satsPerUtxo,
-    script: scriptHex,
-    sourceTransaction: sourceTx,
+    txid, vout: i, satoshis: satsPerUtxo, script: scriptHex, sourceTransaction: tx,
   }));
 }
 
@@ -287,7 +365,7 @@ export async function executeChainSteps(
 
       // Compute txid
       const chainTxid = broadcast
-        ? regtest.broadcastOnly(chainTx)
+        ? await getNetwork().broadcast(chainTx)
         : chainTx.id('hex');
 
       totalBytes += Math.floor(chainTx.toHex().length / 2);
@@ -358,7 +436,12 @@ export async function executeChain(
   const numSteps = receptor.atoms.length;
   const stepTxids: string[] = [];
   const states: ChainState[] = [];
-  const broadcast = fast ? regtest.broadcastOnly : regtest.broadcastAndMine;
+  const net = getNetwork();
+  const broadcastFn = async (tx: Transaction) => {
+    const txid = await net.broadcast(tx);
+    if (!fast) await net.mine(1);
+    return txid;
+  };
 
   try {
     // Genesis TX
@@ -375,7 +458,7 @@ export async function executeChain(
     await genesisTx.fee(new SatoshisPerKilobyte(config.feePerKb));
     await genesisTx.sign();
 
-    const genesisTxid = broadcast(genesisTx);
+    const genesisTxid = await broadcastFn(genesisTx);
     onEvent?.({ type: 'genesis', moleculeId: molecule.id, txid: genesisTxid });
 
     // Chain steps — use in-memory TX objects to avoid getRawTx round-trips
@@ -406,7 +489,7 @@ export async function executeChain(
       const nextLock = buildChainLockScript(numAtoms, newScore, compiledAsm);
       chainTx.addOutput({ lockingScript: nextLock, satoshis: 1 });
 
-      const chainTxid = broadcast(chainTx);
+      const chainTxid = await broadcastFn(chainTx);
       stepTxids.push(chainTxid);
 
       states.push({

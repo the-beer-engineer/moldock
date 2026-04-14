@@ -26,7 +26,9 @@ import { dashboardHtml } from './dashboard.js';
 import { config } from './config.js';
 import type { Molecule, ReceptorSite } from './types.js';
 
-import * as regtest from './regtest.js';
+import { getNetwork } from './network.js';
+
+const network = getNetwork();
 
 // --- Configuration ---
 const PORT = parseInt(process.env.PORT ?? '3456');
@@ -70,9 +72,16 @@ async function autoQueueLoop(): Promise<void> {
       continue;
     }
 
+    // Auto-stop: check if run should end (24h, target reached, funds exhausted)
+    const stopCheck = await dispatch.shouldStop();
+    if (stopCheck.stop) {
+      console.log(`\n[auto] RUN COMPLETE: ${stopCheck.reason}`);
+      autoQueueRunning = false;
+      break;
+    }
+
     // Only queue more if the external queue is low
-    const stats = dispatch.getStats();
-    const queueDepth = dispatch.getUnifiedStats().queueDepth;
+    const queueDepth = (await dispatch.getUnifiedStats()).queueDepth;
     if (queueDepth > AUTO_QUEUE_SIZE * 2) {
       // Plenty of work queued — wait
       await sleep(AUTO_QUEUE_INTERVAL_MS);
@@ -95,9 +104,10 @@ async function postBountyBatch(count: number): Promise<void> {
 
   const real = getRealMolecules(count);
   const molecules = real.molecules;
-  const receptor = real.receptor;
+  const receptors = real.receptors;
+  const defaultReceptor = real.receptor;
 
-  // Pre-compile ASM for all atom counts
+  // Pre-compile ASM for all ligand atom counts (script is parameterized by ligand atoms, not receptor)
   const atomCounts = [...new Set(molecules.map(m => m.atoms.length))];
   const asmMap = new Map<number, string>();
   for (const ac of atomCounts) {
@@ -119,6 +129,9 @@ async function postBountyBatch(count: number): Promise<void> {
     const utxo = fundingUtxos[i];
     const compiledAsm = asmMap.get(mol.atoms.length)!;
 
+    // Look up the correct receptor for this molecule
+    const molReceptor = ((mol as any).receptorId && receptors.get((mol as any).receptorId)) || defaultReceptor;
+
     const genesisTx = new Transaction();
     genesisTx.version = 2;
     genesisTx.addInput({
@@ -131,23 +144,23 @@ async function postBountyBatch(count: number): Promise<void> {
     await genesisTx.fee(new SatoshisPerKilobyte(config.feePerKb));
     await genesisTx.sign();
 
-    const genesisTxid = regtest.broadcastOnly(genesisTx);
+    const genesisTxid = await network.broadcast(genesisTx);
     txsSinceLastMine++;
 
     workItems.push({
       molecule: mol,
-      receptor,
+      receptor: molReceptor,
       compiledAsm,
       genesisTxHex: genesisTx.toHex(),
       genesisTxid,
     });
 
     if (txsSinceLastMine >= 20) {
-      regtest.mine(1);
+      await network.mine(1);
       txsSinceLastMine = 0;
     }
   }
-  if (txsSinceLastMine > 0) regtest.mine(1);
+  if (txsSinceLastMine > 0) await network.mine(1);
 
   // Enqueue into dispatch
   const batchId = randomUUID().slice(0, 8);
@@ -213,11 +226,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // --- Stats ---
   if (method === 'GET' && url.pathname === '/api/stats') {
     if (!dispatch) { json(res, { status: 'initializing' }); return; }
-    const ds = dispatch.getUnifiedStats();
+    const ds = await dispatch.getUnifiedStats();
     let blockHeight = 0;
-    try { blockHeight = regtest.getBlockCount(); } catch {}
+    try { blockHeight = await network.getBlockHeight(); } catch {}
+    const stopCheck = await dispatch.shouldStop();
     json(res, {
-      status: ds.totalAgents > 0 ? 'running' : 'waiting',
+      status: stopCheck.stop ? 'completed' : (ds.totalAgents > 0 ? 'running' : 'waiting'),
+      stopReason: stopCheck.stop ? stopCheck.reason : null,
       ...ds,
       blockHeight,
       totalBountiesPosted,
@@ -296,7 +311,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
     const agentId = passMatch[1];
     const body = JSON.parse(await readBody(req));
-    const result = await dispatch.submitPass(agentId, body.workId, body.finalScore, body.chainTxHexes ?? []);
+    const result = await dispatch.submitPass(agentId, body.workId, body.finalScore, body.chainTxHexes ?? [], body.alreadyBroadcast === true);
     if (!result.ok) { json(res, { error: result.error }, 400); return; }
     json(res, { ok: true, feePackage: result.feePackage });
     return;
@@ -334,10 +349,56 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // --- Node Info ---
   if (method === 'GET' && url.pathname === '/api/node') {
     try {
-      const height = regtest.getBlockCount();
+      const height = await network.getBlockHeight();
       json(res, { status: 'connected', height, network: config.network });
     } catch {
       json(res, { status: 'disconnected', network: config.network });
+    }
+    return;
+  }
+
+  // --- Broadcast forwarder (browser agents can't reach bitcoind on regtest due to CORS) ---
+  if (method === 'POST' && url.pathname === '/api/broadcast') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const txHex: string | undefined = body.txHex;
+      const txHexes: string[] | undefined = body.txHexes;
+
+      if (txHexes && Array.isArray(txHexes)) {
+        const txids: string[] = [];
+        const errors: Array<{ index: number; error: string }> = [];
+        let backoff = false;
+        for (let i = 0; i < txHexes.length; i++) {
+          try {
+            const txid = await network.broadcastHex(txHexes[i]);
+            txids.push(txid);
+          } catch (err: any) {
+            const msg = err.message || '';
+            if (/already.known|txn.already|duplicate/i.test(msg)) {
+              txids.push('(already-known)');
+              continue;
+            }
+            if (/too.long.mempool.chain|mempool.full|chain.too.long|limit.?ancestor|limit.?descendant/i.test(msg)) {
+              backoff = true;
+              errors.push({ index: i, error: 'mempool-chain-limit' });
+              break;
+            }
+            errors.push({ index: i, error: msg });
+            break;
+          }
+        }
+        json(res, { ok: errors.length === 0, txids, errors, backoff });
+        return;
+      }
+
+      if (!txHex || typeof txHex !== 'string') {
+        json(res, { error: 'Missing txHex or txHexes' }, 400);
+        return;
+      }
+      const txid = await network.broadcastHex(txHex);
+      json(res, { ok: true, txid });
+    } catch (err: any) {
+      json(res, { error: err.message }, 400);
     }
     return;
   }
@@ -383,6 +444,41 @@ server.listen(PORT, async () => {
 
   // Start autonomous bounty posting
   autoQueueLoop();
+
+  // Regtest-only: auto-mine ticker. Drains mempool every 3s so browser-broadcast
+  // chain TXs never pile up past BSV's ancestor threshold. On testnet/mainnet ARC
+  // handles this automatically.
+  if (config.network === 'regtest') {
+    setInterval(async () => {
+      try {
+        const regtest = await import('./regtest.js');
+        const mempool = regtest.getRawMempool();
+        if (mempool.length > 0) {
+          regtest.mine(1);
+        }
+      } catch {
+        // non-fatal — node might be briefly unavailable
+      }
+    }, 3000);
+    console.log(`[server] Regtest auto-mine ticker enabled (3s)`);
+  }
+
+  // Chain verification ticker. Every 15s, scan recently verified works and re-broadcast
+  // any whose head TX has been dropped from the node's mempool without being mined.
+  // This is the "trust layer" — even though browsers broadcast directly, dispatch has
+  // the full chain hex and can replay it if anything goes missing.
+  setInterval(async () => {
+    if (!dispatch) return;
+    try {
+      const result = await dispatch.verifyAndRebroadcastRecent({ ageMsMin: 8000, maxPerRun: 30 });
+      if (result.rebroadcast > 0 || result.dropped > 0) {
+        console.log(`[verify] checked=${result.checked} rebroadcast=${result.rebroadcast} dropped=${result.dropped}`);
+      }
+    } catch (err: any) {
+      console.error(`[verify] error: ${err.message}`);
+    }
+  }, 15000);
+  console.log(`[server] Chain verification ticker enabled (15s)`);
 });
 
 function sleep(ms: number): Promise<void> {
