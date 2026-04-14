@@ -401,7 +401,7 @@ async function refresh(){
     if (stats.moleculeCount) $('target-drugs-sub').textContent = stats.moleculeCount;
     if (stats.receptorCount) $('target-receptors-sub').textContent = stats.receptorCount;
 
-    // Wallet balance
+    // Wallet balance — update both the stats panel and the funding banner
     const walBal = stats.walletBalanceSats || 0;
     const walEl = $('target-wallet');
     if (walBal < 5000) {
@@ -410,6 +410,13 @@ async function refresh(){
     } else {
       walEl.textContent = (walBal / 100000000).toFixed(4) + ' BSV';
       walEl.className = 'good';
+    }
+    // Keep the funding banner balance in sync (refreshes every 500ms vs the 60s scan)
+    const fundEl = $('fund-balance');
+    if (fundEl) {
+      fundEl.textContent = walBal >= 100000000
+        ? (walBal / 100000000).toFixed(4) + ' BSV'
+        : walBal.toLocaleString() + ' sats';
     }
 
     // Run status banner
