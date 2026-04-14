@@ -671,136 +671,29 @@ export class DispatchManager {
     return result;
   }
 
-  // --- Paymail Resolution ---
-  // Resolves a HandCash handle ($handle) or paymail (user@domain) to a locking script.
-  // Returns null if resolution fails.
-  private async resolvePaymailScript(paymail: string, satoshis: number): Promise<{ script: Script; reference?: string } | null> {
-    try {
-      // Convert $handle to paymail format
-      let address = paymail;
-      if (address.startsWith('$')) {
-        address = address.slice(1) + '@handcash.io';
-      }
-
-      // If it doesn't contain @, it might be a raw BSV address — not a paymail
-      if (!address.includes('@')) return null;
-
-      const [alias, domain] = address.split('@');
-
-      // Discover paymail capabilities (try cloud.handcash.io for HandCash, else domain directly)
-      const hosts = domain === 'handcash.io'
-        ? ['cloud.handcash.io']
-        : [domain];
-
-      let capabilities: any = null;
-      for (const host of hosts) {
-        try {
-          const res = await fetch(`https://${host}/.well-known/bsvalias`, {
-            headers: { 'Accept': 'application/json' },
-          });
-          if (res.ok) {
-            capabilities = await res.json();
-            break;
-          }
-        } catch { /* try next host */ }
-      }
-      if (!capabilities?.capabilities) {
-        console.log(`[dispatch] Paymail discovery failed for ${address}`);
-        return null;
-      }
-
-      // Try P2P payment destination first (returns output scripts directly)
-      const p2pDestUrl = capabilities.capabilities['2a40af698840'];
-      if (p2pDestUrl) {
-        const url = p2pDestUrl.replace('{alias}', alias).replace('{domain.tld}', domain);
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ satoshis }),
-        });
-        if (res.ok) {
-          const data = await res.json() as any;
-          if (data.outputs?.length > 0) {
-            const output = data.outputs[0];
-            console.log(`[dispatch] Resolved ${paymail} via P2P destination`);
-            return { script: Script.fromHex(output.script), reference: data.reference };
-          }
-        }
-      }
-
-      // Fall back to basic paymentDestination (returns an address)
-      const basicUrl = capabilities.capabilities['paymentDestination'];
-      if (basicUrl) {
-        const url = basicUrl.replace('{alias}', alias).replace('{domain.tld}', domain);
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            senderName: 'MolDock Dispatch',
-            senderHandle: 'moldock@dispatch.local',
-            dt: Math.floor(Date.now() / 1000),
-            amount: satoshis,
-            purpose: 'MolDock compute reward',
-          }),
-        });
-        if (res.ok) {
-          const data = await res.json() as any;
-          if (data.output) {
-            console.log(`[dispatch] Resolved ${paymail} via paymentDestination`);
-            return { script: Script.fromHex(data.output) };
-          }
-        }
-      }
-
-      console.log(`[dispatch] No paymail endpoint worked for ${address}`);
-      return null;
-    } catch (err: any) {
-      console.log(`[dispatch] Paymail resolution error for ${paymail}: ${err.message}`);
-      return null;
-    }
-  }
-
   // Check if a string looks like a BSV address (1... or base58, 25-34 chars)
   private isBsvAddress(str: string): boolean {
     return /^[1mn][a-km-zA-HJ-NP-Z1-9]{24,33}$/.test(str);
   }
 
   // --- Reward Payment ---
-  // Pay to: HandCash handle ($handle), BSV address, or fallback to P2PK pubkey
+  // Pay to: BSV address (P2PKH), or fallback to agent's registered pubkey (P2PK)
   // rewardSats: pass = REWARD_BASE_SATS + (REWARD_PER_CHAIN_TX_SATS × chainSteps), fail = REWARD_BASE_SATS
   private async payReward(agent: RemoteAgent, rewardSats: number = REWARD_BASE_SATS): Promise<string> {
     let agentLockScript: Script;
-    let paymailRef: string | undefined;
-    const destination = agent.paymail;
+    const destination = agent.paymail; // now always a plain BSV address (or empty)
 
-    if (destination?.startsWith('$') || (destination && destination.includes('@'))) {
-      // HandCash handle or paymail — resolve to output script
-      const resolved = await this.resolvePaymailScript(destination, rewardSats);
-      if (resolved) {
-        agentLockScript = resolved.script;
-        paymailRef = resolved.reference;
-        console.log(`[dispatch] Paying ${agent.name} ${rewardSats} sats via paymail: ${destination}`);
-      } else {
-        // Paymail resolution failed — fall back to P2PK
-        console.log(`[dispatch] Paymail resolution failed for ${agent.name}, falling back to P2PK`);
-        const pubkeyBytes = Buffer.from(agent.pubkey, 'hex');
-        agentLockScript = new Script([
-          { op: pubkeyBytes.length, data: [...pubkeyBytes] },
-          { op: 0xac },
-        ]);
-      }
-    } else if (destination && this.isBsvAddress(destination)) {
-      // Raw BSV address — pay to P2PKH
-      agentLockScript = new P2PKH().lock(destination);
-      console.log(`[dispatch] Paying ${agent.name} ${rewardSats} sats via address: ${destination}`);
-    } else {
-      // No paymail/address — fall back to agent's registered pubkey (P2PK)
-      const pubkeyBytes = Buffer.from(agent.pubkey, 'hex');
-      agentLockScript = new Script([
-        { op: pubkeyBytes.length, data: [...pubkeyBytes] },
-        { op: 0xac },
-      ]);
+    if (!destination || !this.isBsvAddress(destination)) {
+      // No valid BSV address — skip payout, just log it
+      console.log(`[dispatch] No payout address for ${agent.name} — skipping ${rewardSats} sats reward`);
+      agent.totalRewardsSats += rewardSats; // still track as earned
+      this.pushEvent({ type: 'reward', agentName: agent.name, agentId: agent.id, rewardSats });
+      return 'no-address';
     }
+
+    // BSV address — pay to P2PKH
+    agentLockScript = new P2PKH().lock(destination);
+    console.log(`[dispatch] Paying ${agent.name} ${rewardSats} sats → ${destination}`);
 
     const fundingUtxos = await bulkFundWalletP2PK(this.dispatchWallet, 1, rewardSats + 500);
     if (fundingUtxos.length === 0) throw new Error('No funding for reward');
@@ -820,83 +713,12 @@ export class DispatchManager {
     await rewardTx.sign();
 
     const txid = await this.network.broadcast(rewardTx);
-
-    // If paymail P2P was used, submit the TX back via receive-transaction endpoint
-    if (paymailRef && destination) {
-      try {
-        await this.submitPaymailTx(destination, rewardTx, paymailRef);
-      } catch (err: any) {
-        console.log(`[dispatch] Paymail TX submission failed (payment still sent): ${err.message}`);
-      }
-    }
-
     await this.network.mine(1);
     agent.totalRewardsSats += rewardSats;
     const dest = destination || `P2PK(${agent.pubkey.slice(0, 8)}...)`;
     console.log(`[dispatch] Paid ${rewardSats} sats to ${agent.name} → ${dest} (total: ${agent.totalRewardsSats} sats) txid=${txid}`);
     this.pushEvent({ type: 'reward', agentName: agent.name, agentId: agent.id, rewardSats });
     return txid;
-  }
-
-  // Submit signed TX back to paymail receive-transaction endpoint (required for P2P paymail)
-  // Uses Extended Format (EF) hex which embeds parent TXs so the receiver can validate
-  // without needing to look up parent TXs on their own nodes.
-  private async submitPaymailTx(paymail: string, tx: Transaction, reference: string): Promise<void> {
-    let address = paymail;
-    if (address.startsWith('$')) address = address.slice(1) + '@handcash.io';
-    const [alias, domain] = address.split('@');
-
-    const hosts = domain === 'handcash.io' ? ['cloud.handcash.io'] : [domain];
-    for (const host of hosts) {
-      try {
-        const capRes = await fetch(`https://${host}/.well-known/bsvalias`);
-        if (!capRes.ok) { console.log(`[dispatch] Paymail discovery failed for ${host}: ${capRes.status}`); continue; }
-        const caps = await capRes.json() as any;
-
-        // Try receive-beef first (BEEF format includes merkle proofs for mined ancestors)
-        const beefUrl = caps.capabilities?.['5c55a7fdb7bb'];
-        if (beefUrl) {
-          const url = beefUrl.replace('{alias}', alias).replace('{domain.tld}', domain);
-          console.log(`[dispatch] Submitting TX via receive-beef to: ${url}`);
-          try {
-            const beef = tx.toBEEF();
-            const res = await fetch(url, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ beef: Buffer.from(beef).toString('hex'), reference, metadata: { sender: 'MolDock Dispatch', note: 'Compute reward' } }),
-            });
-            if (res.ok) {
-              console.log(`[dispatch] Paymail TX submitted via BEEF to ${paymail} ✓`);
-              return;
-            }
-            const errText = await res.text();
-            console.log(`[dispatch] BEEF receive failed (${res.status}): ${errText}`);
-          } catch (beefErr: any) {
-            console.log(`[dispatch] BEEF generation/submit failed: ${beefErr.message}`);
-          }
-        }
-
-        // Fall back to receive-transaction with EF hex (includes source TXs inline)
-        const receiveUrl = caps.capabilities?.['5f1323cddf31'];
-        if (!receiveUrl) { console.log(`[dispatch] No receive-transaction capability for ${host}`); continue; }
-        const url = receiveUrl.replace('{alias}', alias).replace('{domain.tld}', domain);
-        console.log(`[dispatch] Submitting TX via receive-transaction (EF) to: ${url}`);
-        const efHex = tx.toHexEF();
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ hex: efHex, reference, metadata: { sender: 'MolDock Dispatch', note: 'Compute reward' } }),
-        });
-        if (res.ok) {
-          console.log(`[dispatch] Paymail TX submitted (EF) to ${paymail} ✓`);
-          return;
-        }
-        const errText = await res.text();
-        console.log(`[dispatch] Paymail receive-tx failed (${res.status}): ${errText}`);
-      } catch (err: any) {
-        console.log(`[dispatch] Paymail submit error for ${host}: ${err.message}`);
-      }
-    }
   }
 
   // --- Spot-check Verification ---

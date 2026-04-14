@@ -160,8 +160,13 @@ export function dashboardHtml(): string {
       <input type="text" id="ba-name" placeholder="e.g. DrugHunter42" maxlength="24" autocomplete="off">
     </div>
     <div>
-      <label>HandCash Handle or BSV Address (for rewards)</label><br>
-      <input type="text" id="ba-paymail" placeholder="e.g. $myhandle or 1A1zP1..." maxlength="64" autocomplete="off">
+      <label>BSV Wallet Address (for rewards)</label><br>
+      <input type="text" id="ba-paymail" placeholder="e.g. 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" maxlength="64" autocomplete="off">
+      <div style="margin-top:4px;font-size:11px;color:#888;line-height:1.3">
+        <span style="background:#333;padding:1px 5px;border-radius:3px;margin-right:4px;font-size:10px">ℹ</span>
+        Paste a standard BSV address to receive micropayment rewards. If no address is provided, rewards are tracked but not paid out.
+        HandCash will not display incoming TXs under 1&cent;.
+      </div>
     </div>
   </div>
   <div class="agent-stats" id="browser-stats" style="display:none">
