@@ -25,6 +25,9 @@ export class Wallet {
   readonly network: Network;
   private utxos: UTXO[] = [];
 
+  /** Callback fired on every spendUtxo — used to persist spent outpoints */
+  onSpend?: (txid: string, vout: number) => void;
+
   constructor(wif?: string, network: Network = 'regtest') {
     this.privateKey = wif ? PrivateKey.fromWif(wif) : PrivateKey.fromRandom();
     this.network = network;
@@ -54,6 +57,7 @@ export class Wallet {
   // Remove a spent UTXO
   spendUtxo(txid: string, vout: number) {
     this.utxos = this.utxos.filter(u => !(u.txid === txid && u.vout === vout));
+    this.onSpend?.(txid, vout);
   }
 
   get balance(): number {

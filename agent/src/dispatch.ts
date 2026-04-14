@@ -43,14 +43,14 @@ interface PersistedState {
   results?: PersistedResult[];
   /** "baseMoleculeId::receptorId" keys already tested — for dedup */
   testedKeys?: string[];
-  // Legacy field (no longer written, ignored on load)
-  events?: unknown;
+  /** Outpoints spent in previous sessions ("txid:vout") — prevents reloading from WoC */
+  spentOutpoints?: string[];
 }
 
 const EMPTY_STATE: PersistedState = {
   cumulativeTxs: 0, cumulativeRewardsSats: 0,
   cumulativeProcessed: 0, cumulativePassed: 0, cumulativeFailed: 0,
-  results: [], testedKeys: [],
+  results: [], testedKeys: [], spentOutpoints: [],
 };
 
 function loadState(): PersistedState {
@@ -207,6 +207,10 @@ export class DispatchManager {
   private _balanceCacheOnChain = 0;
   private _balanceCacheTime = 0;
 
+  // Track spent outpoints this session (persisted so WoC reloads don't inflate balance)
+  private spentOutpoints = new Set<string>();
+  private sessionSpentOutpoints: string[] = [];
+
   // Persisted cumulative state (survives restarts)
   private persistedState: PersistedState;
 
@@ -222,6 +226,18 @@ export class DispatchManager {
     for (const key of this.persistedState.testedKeys ?? []) {
       this.testedKeys.add(key);
     }
+
+    // Restore spent outpoints — prevents reloading already-spent UTXOs from WoC
+    for (const op of this.persistedState.spentOutpoints ?? []) {
+      this.spentOutpoints.add(op);
+    }
+
+    // Track future spends via wallet callback
+    wallet.onSpend = (txid, vout) => {
+      const key = `${txid}:${vout}`;
+      this.spentOutpoints.add(key);
+      this.sessionSpentOutpoints.push(key);
+    };
 
     // Load real molecules or generate synthetic ones
     const real = getRealMolecules(100);
@@ -254,7 +270,9 @@ export class DispatchManager {
         : 'https://api.whatsonchain.com/v1/bsv/test';
       if (p2pkhBalance > 0) {
         const p2pkhUtxos = await this.network.fetchUtxos(this.dispatchWallet.address);
+        let p2pkhLoaded = 0;
         for (const u of p2pkhUtxos) {
+          if (this.spentOutpoints.has(`${u.txid}:${u.vout}`)) continue; // already spent
           try {
             const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
             if (!resp.ok) continue;
@@ -265,9 +283,10 @@ export class DispatchManager {
               txid: u.txid, vout: u.vout, satoshis: u.satoshis,
               script: actualScript, sourceTransaction: sourceTx,
             });
+            p2pkhLoaded++;
           } catch { /* skip */ }
         }
-        console.log(`[dispatch] Loaded ${p2pkhUtxos.length} P2PKH UTXOs into wallet`);
+        console.log(`[dispatch] Loaded ${p2pkhLoaded}/${p2pkhUtxos.length} P2PKH UTXOs (${this.spentOutpoints.size} known spent)`);
       }
 
       // 2. Count on-chain TXs from address history
@@ -298,15 +317,14 @@ export class DispatchManager {
       }
 
       // 6. Load P2PK unspent UTXOs into wallet if any are mined
-      // Must fetch full source TX for each UTXO so the SDK can sign spends
+      // Filter out UTXOs that were spent in previous sessions (mempool spends invisible to WoC)
       const p2pkUtxos = await this.network.fetchScriptUtxos?.(p2pkScript) ?? [];
       if (p2pkUtxos.length > 0) {
-        const wocBase = this.network.getNetwork() === 'mainnet'
-          ? 'https://api.whatsonchain.com/v1/bsv/main'
-          : 'https://api.whatsonchain.com/v1/bsv/test';
         let loaded = 0;
+        let skipped = 0;
         let p2pkBal = 0;
         for (const u of p2pkUtxos) {
+          if (this.spentOutpoints.has(`${u.txid}:${u.vout}`)) { skipped++; continue; }
           try {
             const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
             if (!resp.ok) continue;
@@ -323,7 +341,9 @@ export class DispatchManager {
             loaded++;
           } catch { /* skip this UTXO */ }
         }
-        if (loaded > 0) console.log(`[dispatch] Loaded ${loaded} mined P2PK UTXOs (${p2pkBal} sats)`);
+        if (loaded > 0 || skipped > 0) {
+          console.log(`[dispatch] P2PK UTXOs: loaded ${loaded} (${p2pkBal} sats), skipped ${skipped} known-spent`);
+        }
       }
 
       const internalBal = this.dispatchWallet.balance;
@@ -969,6 +989,7 @@ export class DispatchManager {
       cumulativeFailed: this.persistedState.cumulativeFailed + sessionFailed,
       results: allResults,
       testedKeys,
+      spentOutpoints: [...this.spentOutpoints],
     });
   }
 
