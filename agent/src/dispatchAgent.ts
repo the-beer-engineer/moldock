@@ -52,8 +52,8 @@ let dispatchReady = false;
 async function initDispatch(): Promise<void> {
   console.log(`\n[init] Compiling covenant scripts (~10s)...`);
   dispatch = new DispatchManager(wallet);
-  // Scan on-chain state: discover all TXs, load unspent UTXOs, reconcile balance
-  await dispatch.scanOnChainState();
+  // Check for new deposits (UTXOs are restored from state file in constructor)
+  await dispatch.scanForDeposits();
   dispatchReady = true;
   console.log(`[init] Dispatch ready — accepting compute agents on http://localhost:${PORT}`);
 }
@@ -434,10 +434,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // --- Scan for new funding UTXOs ---
   if (method === 'POST' && url.pathname === '/api/scan-funding') {
     try {
-      // Use dispatch stats for authoritative balance (combines on-chain + internal UTXOs)
-      const stats = dispatch ? await dispatch.getUnifiedStats() : null;
-      const balance = stats?.walletBalanceSats ?? await network.getBalance(wallet.address);
-      json(res, { balance, address: wallet.address });
+      // Scan for new P2PKH deposits, then return balance from persisted UTXO set
+      if (dispatch) await dispatch.scanForDeposits();
+      const balance = dispatch ? (await dispatch.getUnifiedStats()).walletBalanceSats : 0;
+      json(res, { balance, address: wallet.address, utxos: dispatch ? (await dispatch.getUnifiedStats()).walletUtxoCount : 0 });
     } catch (err: any) {
       json(res, { balance: 0, address: wallet.address, error: err.message });
     }

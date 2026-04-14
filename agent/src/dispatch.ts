@@ -33,6 +33,15 @@ interface PersistedResult {
 /** Max results to persist — keeps only the best score per base molecule */
 const MAX_PERSISTED_RESULTS = 200;
 
+/** A UTXO persisted to disk (includes source TX hex for signing on reload) */
+interface PersistedUtxo {
+  txid: string;
+  vout: number;
+  satoshis: number;
+  script: string;
+  sourceTxHex: string;
+}
+
 interface PersistedState {
   cumulativeTxs: number;
   cumulativeRewardsSats: number;
@@ -43,14 +52,14 @@ interface PersistedState {
   results?: PersistedResult[];
   /** "baseMoleculeId::receptorId" keys already tested — for dedup */
   testedKeys?: string[];
-  /** Outpoints spent in previous sessions ("txid:vout") — prevents reloading from WoC */
-  spentOutpoints?: string[];
+  /** The wallet's full UTXO set — this IS the balance */
+  utxos?: PersistedUtxo[];
 }
 
 const EMPTY_STATE: PersistedState = {
   cumulativeTxs: 0, cumulativeRewardsSats: 0,
   cumulativeProcessed: 0, cumulativePassed: 0, cumulativeFailed: 0,
-  results: [], testedKeys: [], spentOutpoints: [],
+  results: [], testedKeys: [], utxos: [],
 };
 
 function loadState(): PersistedState {
@@ -203,13 +212,7 @@ export class DispatchManager {
   readonly MAX_RUN_MS = 24 * 60 * 60 * 1000; // 24 hours
   readonly TX_TARGET = 1_500_000;
 
-  // Balance cache (avoid WoC rate-limiting from 500ms dashboard polls)
-  private _balanceCacheOnChain = 0;
-  private _balanceCacheTime = 0;
-
-  // Track spent outpoints this session (persisted so WoC reloads don't inflate balance)
-  private spentOutpoints = new Set<string>();
-  private sessionSpentOutpoints: string[] = [];
+  // Balance is simply the sum of persisted UTXOs — no WoC scanning needed
 
   // Persisted cumulative state (survives restarts)
   private persistedState: PersistedState;
@@ -218,6 +221,20 @@ export class DispatchManager {
     this.dispatchWallet = wallet;
     this.network = getNetwork();
     this.persistedState = loadState();
+    // Restore persisted UTXOs into wallet
+    const persistedUtxos = this.persistedState.utxos ?? [];
+    if (persistedUtxos.length > 0) {
+      for (const pu of persistedUtxos) {
+        const sourceTx = Transaction.fromHex(pu.sourceTxHex);
+        wallet.addUtxo({
+          txid: pu.txid, vout: pu.vout, satoshis: pu.satoshis,
+          script: pu.script, sourceTransaction: sourceTx,
+        });
+      }
+      const bal = persistedUtxos.reduce((s, u) => s + u.satoshis, 0);
+      console.log(`[dispatch] Restored ${persistedUtxos.length} UTXOs (${bal} sats) from state`);
+    }
+
     if (this.persistedState.cumulativeTxs > 0) {
       console.log(`[dispatch] Restored state: ${this.persistedState.cumulativeTxs} cumulative TXs, ${this.persistedState.cumulativeProcessed} processed, ${(this.persistedState.results ?? []).length} results`);
     }
@@ -227,17 +244,9 @@ export class DispatchManager {
       this.testedKeys.add(key);
     }
 
-    // Restore spent outpoints — prevents reloading already-spent UTXOs from WoC
-    for (const op of this.persistedState.spentOutpoints ?? []) {
-      this.spentOutpoints.add(op);
-    }
-
-    // Track future spends via wallet callback
-    wallet.onSpend = (txid, vout) => {
-      const key = `${txid}:${vout}`;
-      this.spentOutpoints.add(key);
-      this.sessionSpentOutpoints.push(key);
-    };
+    // Persist UTXO set on every add/spend so balance is always accurate
+    wallet.onSpend = () => this.persistUtxos();
+    wallet.onAdd = () => this.persistUtxos();
 
     // Load real molecules or generate synthetic ones
     const real = getRealMolecules(100);
@@ -254,103 +263,87 @@ export class DispatchManager {
     console.log(`[dispatch] Loaded ${this.molecules.length} molecules, ${atomCounts.length} atom counts compiled`);
   }
 
-  /** Scan on-chain for all dispatch wallet TXs and reconcile balance + TX count */
-  async scanOnChainState(): Promise<void> {
+  /** Check for new incoming deposits (P2PKH + one-time P2PK bootstrap) */
+  async scanForDeposits(): Promise<void> {
     if (this.network.getNetwork() === 'regtest') return;
 
     try {
-      // 1. Get on-chain P2PKH balance (incoming funds not yet spent by the wallet)
-      const p2pkhBalance = await this.network.getBalance(this.dispatchWallet.address);
-      this._balanceCacheOnChain = p2pkhBalance;
-      this._balanceCacheTime = Date.now();
-
-      // 1b. Load P2PKH UTXOs into wallet (with full source TXs for spending)
       const wocBase = this.network.getNetwork() === 'mainnet'
         ? 'https://api.whatsonchain.com/v1/bsv/main'
         : 'https://api.whatsonchain.com/v1/bsv/test';
-      if (p2pkhBalance > 0) {
-        const p2pkhUtxos = await this.network.fetchUtxos(this.dispatchWallet.address);
-        let p2pkhLoaded = 0;
-        for (const u of p2pkhUtxos) {
-          if (this.spentOutpoints.has(`${u.txid}:${u.vout}`)) continue; // already spent
+
+      const known = new Set(this.dispatchWallet.getUtxos().map(u => `${u.txid}:${u.vout}`));
+
+      // One-time bootstrap: if wallet is empty (no persisted UTXOs), scan WoC for P2PK UTXOs
+      if (this.dispatchWallet.getUtxos().length === 0) {
+        console.log(`[dispatch] No persisted UTXOs — bootstrapping from WoC...`);
+        const p2pkScript = this.dispatchWallet.p2pkLockingScript().toHex();
+        const p2pkUtxos = await this.network.fetchScriptUtxos?.(p2pkScript) ?? [];
+        for (const u of p2pkUtxos) {
           try {
             const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
             if (!resp.ok) continue;
-            const txHex = await resp.text();
-            const sourceTx = Transaction.fromHex(txHex);
-            const actualScript = sourceTx.outputs[u.vout].lockingScript!.toHex();
+            const sourceTx = Transaction.fromHex(await resp.text());
             this.dispatchWallet.addUtxo({
               txid: u.txid, vout: u.vout, satoshis: u.satoshis,
-              script: actualScript, sourceTransaction: sourceTx,
+              script: p2pkScript, sourceTransaction: sourceTx,
             });
-            p2pkhLoaded++;
+            known.add(`${u.txid}:${u.vout}`);
           } catch { /* skip */ }
         }
-        console.log(`[dispatch] Loaded ${p2pkhLoaded}/${p2pkhUtxos.length} P2PKH UTXOs (${this.spentOutpoints.size} known spent)`);
-      }
-
-      // 2. Count on-chain TXs from address history
-      const addrHistory = await this.network.getAddressHistory?.(this.dispatchWallet.address) ?? [];
-      console.log(`[dispatch] On-chain: ${addrHistory.length} P2PKH TXs, ${p2pkhBalance} sats available`);
-
-      // 3. Check P2PK script for mined TXs (may be empty if TXs are still in mempool)
-      const p2pkScript = this.dispatchWallet.p2pkLockingScript().toHex();
-      const scriptHistory = await this.network.getScriptHistory?.(p2pkScript) ?? [];
-      if (scriptHistory.length > 0) {
-        console.log(`[dispatch] On-chain: ${scriptHistory.length} P2PK TXs found`);
-      }
-
-      // 4. Merge unique on-chain txids
-      const allTxids = new Set<string>();
-      for (const tx of addrHistory) allTxids.add(tx.tx_hash);
-      for (const tx of scriptHistory) allTxids.add(tx.tx_hash);
-      const onChainTxCount = allTxids.size;
-
-      // 5. Use the higher of on-chain count or persisted count
-      // (persisted count includes mempool TXs from previous sessions)
-      if (onChainTxCount > this.persistedState.cumulativeTxs) {
-        console.log(`[dispatch] Updating TX count from ${this.persistedState.cumulativeTxs} → ${onChainTxCount} (on-chain higher)`);
-        this.persistedState.cumulativeTxs = onChainTxCount;
-        saveState(this.persistedState);
-      } else {
-        console.log(`[dispatch] Persisted TX count (${this.persistedState.cumulativeTxs}) ≥ on-chain (${onChainTxCount}) — keeping persisted`);
-      }
-
-      // 6. Load P2PK unspent UTXOs into wallet if any are mined
-      // Filter out UTXOs that were spent in previous sessions (mempool spends invisible to WoC)
-      const p2pkUtxos = await this.network.fetchScriptUtxos?.(p2pkScript) ?? [];
-      if (p2pkUtxos.length > 0) {
-        let loaded = 0;
-        let skipped = 0;
-        let p2pkBal = 0;
-        for (const u of p2pkUtxos) {
-          if (this.spentOutpoints.has(`${u.txid}:${u.vout}`)) { skipped++; continue; }
-          try {
-            const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
-            if (!resp.ok) continue;
-            const txHex = await resp.text();
-            const sourceTx = Transaction.fromHex(txHex);
-            this.dispatchWallet.addUtxo({
-              txid: u.txid,
-              vout: u.vout,
-              satoshis: u.satoshis,
-              script: p2pkScript,
-              sourceTransaction: sourceTx,
-            });
-            p2pkBal += u.satoshis;
-            loaded++;
-          } catch { /* skip this UTXO */ }
-        }
-        if (loaded > 0 || skipped > 0) {
-          console.log(`[dispatch] P2PK UTXOs: loaded ${loaded} (${p2pkBal} sats), skipped ${skipped} known-spent`);
+        if (p2pkUtxos.length > 0) {
+          console.log(`[dispatch] Bootstrapped ${p2pkUtxos.length} P2PK UTXOs from WoC`);
         }
       }
 
-      const internalBal = this.dispatchWallet.balance;
-      console.log(`[dispatch] Wallet: ${internalBal > 0 ? internalBal : p2pkhBalance} sats spendable`);
+      // Check for new P2PKH deposits not already in our UTXO set
+      const p2pkhUtxos = await this.network.fetchUtxos(this.dispatchWallet.address);
+      let newDeposits = 0;
+      let newSats = 0;
+      for (const u of p2pkhUtxos) {
+        if (known.has(`${u.txid}:${u.vout}`)) continue;
+        try {
+          const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
+          if (!resp.ok) continue;
+          const txHex = await resp.text();
+          const sourceTx = Transaction.fromHex(txHex);
+          const actualScript = sourceTx.outputs[u.vout].lockingScript!.toHex();
+          this.dispatchWallet.addUtxo({
+            txid: u.txid, vout: u.vout, satoshis: u.satoshis,
+            script: actualScript, sourceTransaction: sourceTx,
+          });
+          newDeposits++;
+          newSats += u.satoshis;
+        } catch { /* skip */ }
+      }
+      if (newDeposits > 0) {
+        console.log(`[dispatch] New deposits: ${newDeposits} UTXOs (${newSats} sats)`);
+      }
+
+      console.log(`[dispatch] Wallet: ${this.dispatchWallet.balance} sats, ${this.dispatchWallet.getUtxos().length} UTXOs`);
     } catch (err: any) {
-      console.log(`[dispatch] On-chain scan failed (continuing with persisted state): ${err.message}`);
+      console.log(`[dispatch] Deposit scan failed: ${err.message}`);
     }
+  }
+
+  /** Persist the wallet's current UTXO set to disk (debounced — called on every add/spend) */
+  private _persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private persistUtxos(): void {
+    // Debounce: batch rapid add/spend calls into a single write
+    if (this._persistTimer) return;
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      const utxos: PersistedUtxo[] = this.dispatchWallet.getUtxos().map(u => ({
+        txid: u.txid,
+        vout: u.vout,
+        satoshis: u.satoshis,
+        script: u.script,
+        sourceTxHex: u.sourceTransaction ? u.sourceTransaction.toHex() : '',
+      })).filter(u => u.sourceTxHex.length > 0);
+
+      this.persistedState.utxos = utxos;
+      saveState(this.persistedState);
+    }, 100);
   }
 
   private pushEvent(event: Omit<DispatchEvent, 'timestamp'>): void {
@@ -989,7 +982,10 @@ export class DispatchManager {
       cumulativeFailed: this.persistedState.cumulativeFailed + sessionFailed,
       results: allResults,
       testedKeys,
-      spentOutpoints: [...this.spentOutpoints],
+      utxos: this.dispatchWallet.getUtxos().map(u => ({
+        txid: u.txid, vout: u.vout, satoshis: u.satoshis, script: u.script,
+        sourceTxHex: u.sourceTransaction ? u.sourceTransaction.toHex() : '',
+      })).filter(u => u.sourceTxHex.length > 0),
     });
   }
 
@@ -1041,20 +1037,9 @@ export class DispatchManager {
     const etaMs = txsPerSecond > 0 ? (txsRemaining / txsPerSecond) * 1000 : 0;
     const timeRemainingMs = Math.max(0, this.MAX_RUN_MS - elapsed);
 
-    // Wallet balance — use internal UTXO set as authoritative source.
-    // On-chain P2PKH balance may overlap with internal UTXOs (child TXs not yet mined).
-    // Cache WoC balance for the funding display; use wallet.balance for operational decisions.
-    const now = Date.now();
-    if (now - this._balanceCacheTime > 30000) {
-      try {
-        this._balanceCacheOnChain = await this.network.getBalance(this.dispatchWallet.address);
-        this._balanceCacheTime = now;
-      } catch { /* keep stale cache */ }
-    }
-    // Internal balance = spendable UTXOs the wallet knows about
-    // If wallet has no UTXOs yet (fresh start), fall back to on-chain balance
-    const internalBal = this.dispatchWallet.balance;
-    const walletBalanceSats = Math.max(internalBal, this._balanceCacheOnChain);
+    // Wallet balance = sum of persisted UTXOs. Simple and accurate.
+    const walletBalanceSats = this.dispatchWallet.balance;
+    const walletUtxoCount = this.dispatchWallet.getUtxos().length;
 
     // Run status flags
     const targetReached = totalTxs >= this.TX_TARGET;
@@ -1082,6 +1067,7 @@ export class DispatchManager {
       timeRemainingMs,
       maxRunMs: this.MAX_RUN_MS,
       walletBalanceSats,
+      walletUtxoCount,
       targetReached,
       timeExpired,
       fundsExhausted,

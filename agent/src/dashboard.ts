@@ -475,7 +475,7 @@ async function refresh(){
 
     // Leaderboard
     const sorted = (results||[]).sort((a,b) => a.finalScore - b.finalScore);
-    $('leaderboard').innerHTML=sorted.slice(0,25).map((r,i)=>{
+    $('leaderboard').innerHTML=sorted.slice(0,20).map((r,i)=>{
       const cls=r.passed?'score good':'score bad';
       const res=r.passed?'<span class="pass">PASS</span>':'<span class="fail">FAIL</span>';
       const tgt=(r.receptorName||'').replace(/\s*\(PDB.*\)/,'').slice(0,20);

@@ -25,8 +25,9 @@ export class Wallet {
   readonly network: Network;
   private utxos: UTXO[] = [];
 
-  /** Callback fired on every spendUtxo — used to persist spent outpoints */
+  /** Callbacks for UTXO changes — used to persist wallet state */
   onSpend?: (txid: string, vout: number) => void;
+  onAdd?: (utxo: UTXO) => void;
 
   constructor(wif?: string, network: Network = 'regtest') {
     this.privateKey = wif ? PrivateKey.fromWif(wif) : PrivateKey.fromRandom();
@@ -44,10 +45,11 @@ export class Wallet {
 
   addUtxo(utxo: UTXO) {
     this.utxos.push(utxo);
+    this.onAdd?.(utxo);
   }
 
   addUtxos(utxos: UTXO[]) {
-    this.utxos.push(...utxos);
+    for (const u of utxos) this.addUtxo(u);
   }
 
   getUtxos(): UTXO[] {
