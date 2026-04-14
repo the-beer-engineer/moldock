@@ -12,7 +12,7 @@
  *   6. Receives payment in the final chain TX
  *
  * Usage:
- *   npx tsx src/computeAgent.ts --server http://localhost:3456 --name MyAgent
+ *   npx tsx src/computeAgent.ts --server http://localhost:3456 --name MyAgent --address 1YourBsvAddress...
  *   COMPUTE_PRIVATE_KEY=<wif> npx tsx src/computeAgent.ts --server http://... --name Bot1
  */
 
@@ -349,10 +349,10 @@ async function main() {
     }
   } catch {}
 
-  // Get paymail
-  let paymail = getArg('--paymail') ?? '';
+  // Get BSV address for reward payouts
+  let paymail = getArg('--address') ?? getArg('--paymail') ?? '';
   if (!paymail && !args.includes('--no-prompt')) {
-    paymail = await prompt('  Paymail or BSV address (for rewards): > ');
+    paymail = await prompt('  BSV address for rewards (or leave blank to skip payouts): > ');
   }
 
   // Register

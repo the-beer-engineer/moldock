@@ -19,19 +19,38 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const STATE_FILE = resolve(__dirname, '../../.moldock-state.json');
 
+interface PersistedResult {
+  moleculeId: string;
+  agentName: string;
+  passed: boolean;
+  finalScore: number;
+  totalTxs: number;
+  receptorName: string;
+  chainSteps: number;
+}
+
 interface PersistedState {
   cumulativeTxs: number;
   cumulativeRewardsSats: number;
   cumulativeProcessed: number;
   cumulativePassed: number;
   cumulativeFailed: number;
+  results?: PersistedResult[];
+  events?: DispatchEvent[];
 }
+
+const EMPTY_STATE: PersistedState = {
+  cumulativeTxs: 0, cumulativeRewardsSats: 0,
+  cumulativeProcessed: 0, cumulativePassed: 0, cumulativeFailed: 0,
+  results: [], events: [],
+};
 
 function loadState(): PersistedState {
   try {
-    return JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    const raw = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    return { ...EMPTY_STATE, ...raw };
   } catch {
-    return { cumulativeTxs: 0, cumulativeRewardsSats: 0, cumulativeProcessed: 0, cumulativePassed: 0, cumulativeFailed: 0 };
+    return { ...EMPTY_STATE };
   }
 }
 
@@ -139,8 +158,8 @@ export class DispatchManager {
   // Batch tracking for dashboard-initiated jobs
   private batches = new Map<string, { total: number; completed: number; onComplete?: () => void }>();
 
-  // Event log
-  private recentEvents: DispatchEvent[] = [];
+  // Event log — sessionEvents tracks new events this session; full log = persisted + session
+  private sessionEvents: DispatchEvent[] = [];
   private maxEvents = 500;
 
   // Timing & limits
@@ -274,12 +293,16 @@ export class DispatchManager {
   }
 
   private pushEvent(event: Omit<DispatchEvent, 'timestamp'>): void {
-    this.recentEvents.push({ ...event, timestamp: new Date().toISOString() });
-    if (this.recentEvents.length > this.maxEvents) this.recentEvents.shift();
+    const full = { ...event, timestamp: new Date().toISOString() };
+    this.sessionEvents.push(full);
+    if (this.sessionEvents.length > this.maxEvents) this.sessionEvents.shift();
   }
 
   getRecentEvents(): DispatchEvent[] {
-    return this.recentEvents;
+    // Merge persisted events from prior sessions with current session events
+    const persisted = this.persistedState.events ?? [];
+    const all = [...persisted, ...this.sessionEvents];
+    return all.slice(-this.maxEvents);
   }
 
   // --- Agent Registration ---
@@ -862,13 +885,44 @@ export class DispatchManager {
     const sessionPassed = agents.reduce((s, a) => s + a.totalPassed, 0);
     const sessionFailed = agents.reduce((s, a) => s + a.totalFailed, 0);
     const sessionRewards = agents.reduce((s, a) => s + a.totalRewardsSats, 0);
+
+    // Merge session results with previously persisted results
+    const sessionResults = this.getSessionResults();
+    const allResults = [...(this.persistedState.results ?? []), ...sessionResults];
+
+    // Merge events: keep last 500 across all sessions
+    const allEvents = [...(this.persistedState.events ?? []), ...this.sessionEvents];
+    const trimmedEvents = allEvents.slice(-this.maxEvents);
+
     saveState({
       cumulativeTxs: this.persistedState.cumulativeTxs + sessionTxs,
       cumulativeRewardsSats: this.persistedState.cumulativeRewardsSats + sessionRewards,
       cumulativeProcessed: this.persistedState.cumulativeProcessed + sessionProcessed,
       cumulativePassed: this.persistedState.cumulativePassed + sessionPassed,
       cumulativeFailed: this.persistedState.cumulativeFailed + sessionFailed,
+      results: allResults,
+      events: trimmedEvents,
     });
+  }
+
+  /** Get results from this session only (not previously persisted) */
+  private getSessionResults(): PersistedResult[] {
+    const results: PersistedResult[] = [];
+    for (const w of this.work.values()) {
+      if (w.status === 'pass' || w.status === 'verified' || w.status === 'fail') {
+        const agent = this.agents.get(w.agentId);
+        results.push({
+          moleculeId: w.molecule.id,
+          agentName: agent?.name ?? 'unknown',
+          passed: w.status === 'pass' || w.status === 'verified',
+          finalScore: w.finalScore ?? 0,
+          totalTxs: w.numSteps + 1,
+          receptorName: w.receptor.name ?? '',
+          chainSteps: w.numSteps,
+        });
+      }
+    }
+    return results;
   }
 
   async getUnifiedStats() {
@@ -996,32 +1050,10 @@ export class DispatchManager {
     });
   }
 
-  /** Get completed work items with scores for the leaderboard */
-  getResults(): Array<{
-    moleculeId: string; agentName: string; passed: boolean;
-    finalScore: number; totalTxs: number; totalBytes: number;
-    receptorName: string; chainSteps: number;
-  }> {
-    const results: Array<{
-      moleculeId: string; agentName: string; passed: boolean;
-      finalScore: number; totalTxs: number; totalBytes: number;
-      receptorName: string; chainSteps: number;
-    }> = [];
-    for (const w of this.work.values()) {
-      if (w.status === 'pass' || w.status === 'verified' || w.status === 'fail') {
-        const agent = this.agents.get(w.agentId);
-        results.push({
-          moleculeId: w.molecule.id,
-          agentName: agent?.name ?? 'unknown',
-          passed: w.status === 'pass' || w.status === 'verified',
-          finalScore: w.finalScore ?? 0,
-          totalTxs: w.numSteps + 1,
-          totalBytes: 0,
-          receptorName: w.receptor.name ?? '',
-          chainSteps: w.numSteps,
-        });
-      }
-    }
-    return results;
+  /** Get completed work items with scores for the leaderboard (persisted + session) */
+  getResults(): Array<PersistedResult & { totalBytes: number }> {
+    const persisted = (this.persistedState.results ?? []).map(r => ({ ...r, totalBytes: 0 }));
+    const session = this.getSessionResults().map(r => ({ ...r, totalBytes: 0 }));
+    return [...persisted, ...session];
   }
 }
