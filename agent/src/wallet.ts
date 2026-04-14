@@ -60,7 +60,23 @@ export class Wallet {
     return this.utxos.reduce((sum, u) => sum + u.satoshis, 0);
   }
 
-  // Build a P2PK locking script: <pubkey> OP_CHECKSIG
+  // Build a P2PKH locking script for this wallet (standard address-based output)
+  p2pkhLockingScript(): LockingScript {
+    return new P2PKH().lock(this.address);
+  }
+
+  // P2PKH unlocking script template for @bsv/sdk Transaction.sign()
+  p2pkhUnlock(
+    sourceSatoshis?: number,
+    lockingScript?: Script,
+  ) {
+    return new P2PKH().unlock(
+      this.privateKey, 'all', false,
+      sourceSatoshis, lockingScript,
+    );
+  }
+
+  // Legacy aliases — P2PK (raw pubkey, no hash). Used only by covenant chain internals.
   p2pkLockingScript(): LockingScript {
     const pubKeyBytes = this.privateKey.toPublicKey().encode(true) as number[];
     return new LockingScript([
@@ -69,7 +85,6 @@ export class Wallet {
     ]);
   }
 
-  // P2PK unlocking script template for @bsv/sdk Transaction.sign()
   p2pkUnlock(
     sourceSatoshis?: number,
     lockingScript?: Script,
@@ -111,13 +126,13 @@ export class Wallet {
           { op: sigBytes.length, data: sigBytes },
         ]);
       },
-      estimateLength: async () => 74, // 1 (push) + 72 (max DER sig) + 1 (sighash byte)
+      estimateLength: async () => 74,
     };
   }
 
-  // Build a P2PKH locking script for this wallet
+  // Convenience alias
   lockingScript(): LockingScript {
-    return new P2PKH().lock(this.address);
+    return this.p2pkhLockingScript();
   }
 
   toJSON() {

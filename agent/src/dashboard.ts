@@ -110,12 +110,40 @@ export function dashboardHtml(): string {
   .waiting-msg { text-align: center; padding: 30px; color: #555; font-size: 13px; }
   .waiting-msg .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #ffaa00; animation: pulse 1.5s infinite; margin-right: 8px; }
   @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+  /* Funding Banner */
+  .funding-banner { background: linear-gradient(135deg, #1a1a2e, #0f3460); border: 1px solid #00ccff; border-radius: 10px; padding: 18px 24px; margin-bottom: 16px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .funding-qr { background: white; border-radius: 8px; padding: 8px; flex-shrink: 0; }
+  .funding-qr canvas { display: block; }
+  .funding-info { flex: 1; min-width: 200px; }
+  .funding-info h2 { font-size: 15px; color: #00ccff; margin-bottom: 6px; }
+  .funding-info .fund-address { background: #0a0a0a; border: 1px solid #333; border-radius: 4px; padding: 8px 12px; font-size: 12px; color: #e0e0e0; cursor: pointer; user-select: all; word-break: break-all; margin: 6px 0; }
+  .funding-info .fund-address:hover { border-color: #00ccff; }
+  .funding-info .fund-meta { font-size: 11px; color: #88aacc; }
+  .funding-info .fund-meta .balance { color: #00ff88; font-weight: bold; }
+  .funding-info .fund-meta .scan-timer { color: #ffaa00; }
+  .funding-info .fund-copied { color: #00ff88; font-size: 11px; display: none; margin-left: 8px; }
 </style>
 </head>
 <body>
 <h1>MolDock Agent Swarm</h1>
 <div class="subtitle">On-chain molecular docking via BSV covenant chains &mdash; <span id="target-drugs-sub">107</span> FDA-approved drugs vs <span id="target-receptors-sub">8</span> protein targets (CDK2, EGFR, HIV Protease, COVID Mpro, COX-2, ER-alpha, BRAF, AChE)</div>
 <div class="node-status" id="node-status">Node: checking...</div>
+
+<!-- Funding Banner -->
+<div class="funding-banner" id="funding-banner">
+  <div class="funding-qr"><canvas id="qr-canvas" width="140" height="140"></canvas></div>
+  <div class="funding-info">
+    <h2>Fund MolDock</h2>
+    <div style="font-size:11px; color:#88aacc; margin-bottom:4px;">Send BSV to this address to fund docking computations</div>
+    <div class="fund-address" id="fund-address" onclick="copyAddress()" title="Click to copy">Loading...</div>
+    <span class="fund-copied" id="fund-copied">Copied!</span>
+    <div class="fund-meta">
+      Balance: <span class="balance" id="fund-balance">--</span>
+      &nbsp;&bull;&nbsp; Next scan: <span class="scan-timer" id="scan-timer">--</span>
+    </div>
+  </div>
+</div>
 
 <!-- Browser Compute Agent -->
 <div class="agent-banner">
@@ -132,8 +160,8 @@ export function dashboardHtml(): string {
       <input type="text" id="ba-name" placeholder="e.g. DrugHunter42" maxlength="24" autocomplete="off">
     </div>
     <div>
-      <label>HandCash Handle / BSV Address</label><br>
-      <input type="text" id="ba-paymail" placeholder="e.g. $myhandle" maxlength="64" autocomplete="off">
+      <label>HandCash Handle or BSV Address (for rewards)</label><br>
+      <input type="text" id="ba-paymail" placeholder="e.g. $myhandle or 1A1zP1..." maxlength="64" autocomplete="off">
     </div>
   </div>
   <div class="agent-stats" id="browser-stats" style="display:none">
@@ -224,6 +252,92 @@ try {
 const $=id=>document.getElementById(id);
 function fmt(ms){if(!ms)return'--';if(ms<1000)return ms.toFixed(0)+'ms';if(ms<60000)return(ms/1000).toFixed(1)+'s';return(ms/60000).toFixed(1)+'m'}
 function fmtBytes(b){if(!b)return'0B';if(b>1048576)return(b/1048576).toFixed(1)+'MB';if(b>1024)return(b/1024).toFixed(0)+'KB';return b+'B'}
+
+// ========== QR Code Generator (minimal, no dependencies) ==========
+// Generates a BSV-compatible QR code on a canvas element
+function drawQR(canvas, text, size) {
+  // Use a simple QR encoding via the Google Charts API fallback rendered as image
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, size, size);
+    ctx.drawImage(img, 0, 0, size, size);
+  };
+  img.onerror = () => {
+    // Fallback: just show the address text
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#333';
+    ctx.font = '10px monospace';
+    ctx.fillText('QR unavailable', 10, size/2);
+  };
+  // BSV URI format: bitcoin:<address>
+  const uri = 'bitcoin:' + text;
+  img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=' + size + 'x' + size + '&data=' + encodeURIComponent(uri);
+}
+
+function copyAddress() {
+  const addr = $('fund-address').textContent;
+  if (addr && addr !== 'Loading...') {
+    navigator.clipboard.writeText(addr).then(() => {
+      const el = $('fund-copied');
+      el.style.display = 'inline';
+      setTimeout(() => { el.style.display = 'none'; }, 2000);
+    });
+  }
+}
+window.copyAddress = copyAddress;
+
+// ========== UTXO Scan Timer ==========
+const SCAN_INTERVAL_MS = 60000; // 1 minute
+let lastScanTime = Date.now();
+let fundingAddress = null;
+
+function updateScanTimer() {
+  const elapsed = Date.now() - lastScanTime;
+  const remaining = Math.max(0, SCAN_INTERVAL_MS - elapsed);
+  const secs = Math.ceil(remaining / 1000);
+  const el = $('scan-timer');
+  if (el) el.textContent = secs + 's';
+}
+
+async function scanForFunding() {
+  lastScanTime = Date.now();
+  try {
+    const res = await fetch('/api/scan-funding', { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      if ($('fund-balance')) {
+        const bal = data.balance || 0;
+        $('fund-balance').textContent = bal >= 100000000
+          ? (bal / 100000000).toFixed(4) + ' BSV'
+          : bal.toLocaleString() + ' sats';
+      }
+    }
+  } catch(e) { /* ignore scan errors */ }
+}
+
+// Init funding display
+async function initFunding() {
+  try {
+    const res = await fetch('/api/discover');
+    const disc = await res.json();
+    fundingAddress = disc.dispatchAddress;
+    if (fundingAddress && $('fund-address')) {
+      $('fund-address').textContent = fundingAddress;
+      drawQR($('qr-canvas'), fundingAddress, 140);
+    }
+  } catch(e) { /* ignore */ }
+  // Initial scan
+  scanForFunding();
+  // Periodic scan + timer update
+  setInterval(scanForFunding, SCAN_INTERVAL_MS);
+  setInterval(updateScanTimer, 1000);
+}
+initFunding();
 
 // Trust badge
 function trustBadge(level){
@@ -464,9 +578,7 @@ async function toggleBrowserAgent() {
     baLog('Discovered dispatch on ' + browserNetwork, '#88cc88');
     if (browserNetwork !== 'regtest' && BSV.ARC) {
       // ARC-lock: on testnet/mainnet broadcast direct to ARC, bypass dispatch forwarder.
-      const arcUrl = browserNetwork === 'mainnet'
-        ? 'https://arcade-us-1.bsvb.tech/'
-        : 'https://arcade-ttn-us-1.bsvb.tech/';
+      const arcUrl = 'https://arc.gorillapool.io';
       try {
         browserArc = new BSV.ARC(arcUrl);
         baLog('ARC direct broadcast enabled: ' + arcUrl, '#00ff88');
@@ -605,21 +717,55 @@ async function browserWorkLoop() {
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ workId: work.id, finalScore: totalScore }),
         }).then(r => r.json());
+        if (failRes.reward) baStats.earned += failRes.reward;
         nextPrepPromise = prepareNextWork(failRes.nextWork || null);
         baUpdateStats();
         continue;
       }
 
-      // PASS: broadcast step TXs (skip genesis index 0 — dispatch already broadcast it)
-      // while concurrently kicking off prep for the NEXT molecule.
-      $('ba-status').textContent = 'broadcasting...';
+      // PASS: request fee UTXOs from dispatch, rebuild chain with fees, then broadcast.
+      $('ba-status').textContent = 'requesting fees...';
       const t2 = performance.now();
-      const stepTxHexes = chain.txHexes.slice(1);
 
+      // Step 1: Submit pass WITHOUT alreadyBroadcast to get fee UTXOs
+      const passRes = await fetch('/api/agent/' + browserAgentId + '/pass', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          workId: work.id,
+          finalScore: totalScore,
+          chainTxHexes: chain.txHexes,
+          alreadyBroadcast: false,
+        }),
+      }).then(r => r.json());
+
+      if (!passRes.ok) {
+        baLog('Pass rejected: ' + (passRes.error || 'unknown'), '#ff4444');
+        nextPrepPromise = prepareNextWork(null);
+        baUpdateStats();
+        continue;
+      }
+
+      // Step 2: Rebuild chain step TXs with fee inputs
+      const feePackage = passRes.feePackage;
+      const stepTxHexes = chain.txHexes.slice(1); // skip genesis (already broadcast by dispatch)
+      let rebuiltStepHexes = stepTxHexes;
+
+      if (feePackage && feePackage.utxos && feePackage.utxos.length > 0) {
+        $('ba-status').textContent = 'adding fees...';
+        try {
+          rebuiltStepHexes = await rebuildChainWithFees(chain, feePackage.utxos);
+        } catch (rebuildErr) {
+          baLog('Fee rebuild failed: ' + rebuildErr.message + ' — broadcasting without fees', '#ffaa00');
+        }
+      }
+
+      // Step 3: Broadcast rebuilt chain with fees
       // Start next prep in parallel with broadcast.
       nextPrepPromise = prepareNextWork(null);
+      $('ba-status').textContent = 'broadcasting...';
 
-      const bcastRes = await broadcastChainBrowser(stepTxHexes);
+      const bcastRes = await broadcastChainBrowser(rebuiltStepHexes);
       const bcastMs = (performance.now() - t2).toFixed(0);
 
       if (!bcastRes.ok) {
@@ -627,13 +773,14 @@ async function browserWorkLoop() {
           ? 'step ' + bcastRes.errors[0].index + ': ' + bcastRes.errors[0].error
           : (bcastRes.error || 'unknown');
         baLog('Broadcast failed: ' + errMsg, '#ff4444');
+        // Report broadcast failure
         const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ workId: work.id, finalScore: totalScore }),
         }).then(r => r.json());
+        if (failRes.reward) baStats.earned += failRes.reward;
         if (failRes.nextWork) {
-          // Override the already-started prep with the seeded one for fairness.
           nextPrepPromise = prepareNextWork(failRes.nextWork);
         }
         baUpdateStats();
@@ -642,33 +789,15 @@ async function browserWorkLoop() {
 
       baStats.txs += chain.txHexes.length;
       baStats.passed++;
+      baStats.earned += (passRes.reward || 100);
       baLog('PASS ' + molId + ' score=' + totalScore + ' compute=' + computeMs + 'ms build=' + buildMs + 'ms bcast=' + bcastMs + 'ms ' + chain.txHexes.length + ' TXs', '#00ff88');
 
-      // Deliver FULL chainTxHexes (including genesis) back to dispatch so it can
-      // re-broadcast any TX the node drops. Trust layer.
-      const passRes = await fetch('/api/agent/' + browserAgentId + '/pass', {
+      // Confirm broadcast txids for trust accounting
+      fetch('/api/agent/' + browserAgentId + '/confirm', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          workId: work.id,
-          finalScore: totalScore,
-          chainTxHexes: chain.txHexes,
-          alreadyBroadcast: true,
-        }),
-      }).then(r => r.json());
-
-      if (passRes.ok) {
-        baStats.earned += (passRes.reward || 100);
-        // Confirm txids for trust accounting. Don't override nextPrepPromise here —
-        // we already started it in parallel above.
-        fetch('/api/agent/' + browserAgentId + '/confirm', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ workId: work.id, txids: chain.stepTxids }),
-        }).catch(() => {});
-      } else if (passRes.error) {
-        baLog('Pass rejected: ' + passRes.error, '#ff4444');
-      }
+        body: JSON.stringify({ workId: work.id, txids: chain.stepTxids }),
+      }).catch(() => {});
 
       baUpdateStats();
       $('ba-status').textContent = 'idle';
@@ -771,6 +900,96 @@ function buildChainLockScriptBrowser(numAtoms, score, compiledAsm) {
   const fullHex = scorePrefix + '75' + cachedBodyHex;
   const rawBytes = hexToBytes(fullHex);
   return new BSV.Script([], rawBytes, undefined, false);
+}
+
+// Rebuild chain step TXs with fee UTXOs as input 1.
+// The covenant scriptSig on input 0 embeds the previous txid, so adding inputs
+// changes the current txid which changes the next step's scriptSig → must rebuild all.
+async function rebuildChainWithFees(chain, feeUtxos) {
+  const { Transaction, Script, TransactionSignature, Hash, UnlockingScript } = BSV;
+  const stepTxHexes = chain.txHexes.slice(1); // skip genesis
+  if (feeUtxos.length < stepTxHexes.length) {
+    throw new Error('Not enough fee UTXOs: got ' + feeUtxos.length + ' need ' + stepTxHexes.length);
+  }
+
+  const rebuilt = [];
+  let prevTx = Transaction.fromHex(chain.txHexes[0]); // genesis
+  let prevTxid = prevTx.id('hex');
+
+  for (let i = 0; i < stepTxHexes.length; i++) {
+    const origTx = Transaction.fromHex(stepTxHexes[i]);
+    const fee = feeUtxos[i];
+    const feeSrcTx = Transaction.fromHex(fee.sourceTxHex);
+    const feeScript = Script.fromHex(fee.scriptHex);
+    const covenantOutput = origTx.outputs[0];
+
+    // Rebuild scriptSig with updated prevTxid (first push is 0x20 + 32-byte LE txid)
+    const origScriptSig = origTx.inputs[0].unlockingScript.toHex();
+    const newTxidLE = Array.from(hexToBytes(prevTxid)).reverse();
+    const newTxidHex = bytesToHex(new Uint8Array(newTxidLE));
+    const newScriptSig = '20' + newTxidHex + origScriptSig.slice(66);
+
+    const newTx = new Transaction();
+    newTx.version = 2;
+    newTx.lockTime = 0;
+
+    // Input 0: covenant UTXO (data-push scriptSig, not signature-based)
+    newTx.addInput({
+      sourceTransaction: prevTx,
+      sourceOutputIndex: 0,
+      unlockingScript: Script.fromHex(newScriptSig),
+      sequence: 0xffffffff,
+    });
+
+    // Input 1: fee UTXO — P2PK unlock signed by browser's ephemeral key
+    const feeSats = fee.satoshis;
+    newTx.addInput({
+      sourceTransaction: feeSrcTx,
+      sourceOutputIndex: fee.vout,
+      unlockingScriptTemplate: {
+        sign: async function(tx, inputIndex) {
+          const scope = TransactionSignature.SIGHASH_FORKID | TransactionSignature.SIGHASH_ALL;
+          const input = tx.inputs[inputIndex];
+          const otherInputs = tx.inputs.filter((_, idx) => idx !== inputIndex);
+          const sourceTXID = input.sourceTXID || input.sourceTransaction.id('hex');
+          const preimage = TransactionSignature.format({
+            sourceTXID,
+            sourceOutputIndex: input.sourceOutputIndex,
+            sourceSatoshis: feeSats,
+            transactionVersion: tx.version,
+            otherInputs,
+            inputIndex,
+            outputs: tx.outputs,
+            inputSequence: input.sequence,
+            subscript: feeScript,
+            lockTime: tx.lockTime,
+            scope,
+          });
+          const rawSig = browserPrivKey.sign(Hash.sha256(preimage));
+          const sig = new TransactionSignature(rawSig.r, rawSig.s, scope);
+          const sigBytes = sig.toChecksigFormat();
+          return new UnlockingScript([{ op: sigBytes.length, data: sigBytes }]);
+        },
+        estimateLength: async function() { return 74; },
+      },
+      sequence: 0xffffffff,
+    });
+
+    // Output 0: covenant continuation (same as original)
+    newTx.addOutput({
+      lockingScript: covenantOutput.lockingScript,
+      satoshis: covenantOutput.satoshis,
+    });
+
+    // Sign fee input (input 1 only — input 0 uses data-push scriptSig)
+    await newTx.sign();
+
+    rebuilt.push(newTx.toHex());
+    prevTx = newTx;
+    prevTxid = newTx.id('hex');
+  }
+
+  return rebuilt;
 }
 
 function buildChainBrowser(work, stepBatches) {

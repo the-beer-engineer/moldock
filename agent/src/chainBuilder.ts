@@ -147,8 +147,26 @@ export async function fundWalletP2PK(wallet: Wallet, amountBsv: number = 0.05): 
     };
   }
 
-  // Mainnet/testnet: return largest UTXO from wallet
-  const utxos = wallet.getUtxos();
+  // Mainnet/testnet: if no UTXOs cached, fetch from WoC first
+  let utxos = wallet.getUtxos();
+  if (utxos.length === 0) {
+    const wocUtxos = await net.fetchUtxos(wallet.address);
+    const wocBase = net.getNetwork() === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    for (const u of wocUtxos) {
+      const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
+      if (!resp.ok) continue;
+      const txHex = await resp.text();
+      const sourceTx = Transaction.fromHex(txHex);
+      const actualScript = sourceTx.outputs[u.vout].lockingScript!.toHex();
+      wallet.addUtxo({
+        txid: u.txid, vout: u.vout, satoshis: u.satoshis,
+        script: actualScript, sourceTransaction: sourceTx,
+      });
+    }
+    utxos = wallet.getUtxos();
+  }
   if (utxos.length === 0) throw new Error('No UTXOs. Fund wallet: ' + wallet.address);
   const best = [...utxos].sort((a, b) => b.satoshis - a.satoshis)[0];
   return {
@@ -213,12 +231,15 @@ export async function bulkFundWalletP2PK(
       const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
       if (!resp.ok) continue;
       const txHex = await resp.text();
+      const sourceTx = Transaction.fromHex(txHex);
+      // Use the actual script from the source TX output (P2PKH from external sends)
+      const actualScript = sourceTx.outputs[u.vout].lockingScript!.toHex();
       wallet.addUtxo({
         txid: u.txid,
         vout: u.vout,
         satoshis: u.satoshis,
-        script: wallet.p2pkLockingScript().toHex(),
-        sourceTransaction: Transaction.fromHex(txHex),
+        script: actualScript,
+        sourceTransaction: sourceTx,
       });
     }
     utxos = wallet.getUtxos();
@@ -233,12 +254,17 @@ export async function bulkFundWalletP2PK(
     throw new Error(`Largest UTXO (${utxo.satoshis} sats) too small. Need ${totalNeeded} sats.`);
   }
 
-  // Build fan-out TX
+  // Build fan-out TX: detect P2PKH vs P2PK based on script length
+  // P2PKH scripts are 25 bytes (50 hex chars): 76a914{20-byte-hash}88ac
+  // P2PK scripts are 35 bytes (70 hex chars): {33-byte-pubkey}ac
+  const isP2PKH = utxo.script.length === 50 && utxo.script.startsWith('76a914');
   const tx = new Transaction();
   tx.addInput({
     sourceTransaction: utxo.sourceTransaction,
     sourceOutputIndex: utxo.vout,
-    unlockingScriptTemplate: wallet.p2pkUnlock(utxo.satoshis, Script.fromHex(utxo.script)),
+    unlockingScriptTemplate: isP2PKH
+      ? new P2PKH().unlock(wallet.privateKey, 'all', false, utxo.satoshis, Script.fromHex(utxo.script))
+      : wallet.p2pkUnlock(utxo.satoshis, Script.fromHex(utxo.script)),
   });
 
   const lockScript = wallet.p2pkLockingScript();

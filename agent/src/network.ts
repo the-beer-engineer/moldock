@@ -5,7 +5,14 @@
  */
 
 import { Transaction } from '@bsv/sdk';
+import { createHash } from 'crypto';
 import type { UTXO } from './wallet.js';
+
+/** Compute electrum-style script hash: sha256(script) reversed */
+function scriptHashElectrum(scriptHex: string): string {
+  const hash = createHash('sha256').update(Buffer.from(scriptHex, 'hex')).digest();
+  return Buffer.from(hash).reverse().toString('hex');
+}
 
 export type NetworkType = 'regtest' | 'testnet' | 'mainnet';
 
@@ -30,6 +37,12 @@ export interface NetworkAdapter {
   getTxUrl(txid: string): string;
   /** Get block height (0 on testnet/mainnet if unavailable) */
   getBlockHeight(): Promise<number>;
+  /** Fetch unspent UTXOs by raw script hex (for P2PK outputs) */
+  fetchScriptUtxos?(scriptHex: string): Promise<UTXO[]>;
+  /** Get TX history for a script hash */
+  getScriptHistory?(scriptHex: string): Promise<{ tx_hash: string; height: number }[]>;
+  /** Get TX history for an address */
+  getAddressHistory?(address: string): Promise<{ tx_hash: string; height: number }[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,10 +50,11 @@ export interface NetworkAdapter {
 // ---------------------------------------------------------------------------
 const ARC_ENDPOINTS: Record<'testnet' | 'mainnet', string[]> = {
   testnet: [
+    'https://arc.gorillapool.io',
     'https://arcade-testnet-us-1.bsvb.tech',
-    'https://arcade-ttn-us-1.bsvb.tech',
   ],
   mainnet: [
+    'https://arc.gorillapool.io',
     'https://arcade-us-1.bsvb.tech',
   ],
 };
@@ -213,6 +227,44 @@ export class ArcAdapter implements NetworkAdapter {
     if (!resp.ok) return 0;
     const data = await resp.json() as any;
     return (data.confirmed ?? 0) + (data.unconfirmed ?? 0);
+  }
+
+  /** Fetch unspent UTXOs by script hash (for P2PK outputs not visible by address) */
+  async fetchScriptUtxos(scriptHex: string): Promise<UTXO[]> {
+    const wocBase = this.networkType === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    const scriptHash = scriptHashElectrum(scriptHex);
+    const resp = await fetch(`${wocBase}/script/${scriptHash}/unspent`);
+    if (!resp.ok) return [];
+    const data = await resp.json() as any[];
+    return data.map((u: any) => ({
+      txid: u.tx_hash,
+      vout: u.tx_pos,
+      satoshis: u.value,
+      script: scriptHex,
+    }));
+  }
+
+  /** Get full TX history for a script hash (count of all TXs that used this script) */
+  async getScriptHistory(scriptHex: string): Promise<{ tx_hash: string; height: number }[]> {
+    const wocBase = this.networkType === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    const scriptHash = scriptHashElectrum(scriptHex);
+    const resp = await fetch(`${wocBase}/script/${scriptHash}/history`);
+    if (!resp.ok) return [];
+    return await resp.json() as any[];
+  }
+
+  /** Get TX history for an address */
+  async getAddressHistory(address: string): Promise<{ tx_hash: string; height: number }[]> {
+    const wocBase = this.networkType === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    const resp = await fetch(`${wocBase}/address/${address}/history`);
+    if (!resp.ok) return [];
+    return await resp.json() as any[];
   }
 
   async mine(_n?: number): Promise<void> {

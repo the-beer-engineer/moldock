@@ -1,4 +1,12 @@
+import { config as dotenvConfig } from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import type { NetworkType } from './network.js';
+
+// Load .env from project root (one level above agent/)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+dotenvConfig({ path: resolve(__dirname, '../../.env') });
 
 export const config = {
   // Network — controlled by NETWORK env var (regtest|testnet|mainnet)
@@ -31,7 +39,7 @@ export const config = {
 
   // TX parameters
   dustLimit: 1,
-  feePerKb: parseInt(process.env.FEE_RATE_SATS_PER_KB || '10', 10),  // sats/kB — miners accept 3-100
+  feePerKb: parseInt(process.env.FEE_RATE_SATS_PER_KB || '100', 10),  // sats/kB — 100 is safe for ARC
 
   // Agent parameters
   maxParallelChains: 10,

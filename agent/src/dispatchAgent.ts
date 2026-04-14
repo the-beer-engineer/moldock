@@ -52,6 +52,8 @@ let dispatchReady = false;
 async function initDispatch(): Promise<void> {
   console.log(`\n[init] Compiling covenant scripts (~10s)...`);
   dispatch = new DispatchManager(wallet);
+  // Scan on-chain state: discover all TXs, load unspent UTXOs, reconcile balance
+  await dispatch.scanOnChainState();
   dispatchReady = true;
   console.log(`[init] Dispatch ready — accepting compute agents on http://localhost:${PORT}`);
 }
@@ -75,6 +77,12 @@ async function autoQueueLoop(): Promise<void> {
     // Auto-stop: check if run should end (24h, target reached, funds exhausted)
     const stopCheck = await dispatch.shouldStop();
     if (stopCheck.stop) {
+      if (stopCheck.reason.includes('funds exhausted')) {
+        // Don't permanently stop — just pause and retry (funds may arrive)
+        console.log(`[auto] Pausing: ${stopCheck.reason} — will retry in 60s`);
+        await sleep(60000);
+        continue;
+      }
       console.log(`\n[auto] RUN COMPLETE: ${stopCheck.reason}`);
       autoQueueRunning = false;
       break;
@@ -300,6 +308,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (!result.ok) { json(res, { error: result.error }, 400); return; }
     json(res, {
       ok: true,
+      reward: result.reward,
       nextWork: result.nextWork ? serializeWork(result.nextWork) : null,
     });
     return;
@@ -313,7 +322,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const body = JSON.parse(await readBody(req));
     const result = await dispatch.submitPass(agentId, body.workId, body.finalScore, body.chainTxHexes ?? [], body.alreadyBroadcast === true);
     if (!result.ok) { json(res, { error: result.error }, 400); return; }
-    json(res, { ok: true, feePackage: result.feePackage });
+    json(res, { ok: true, reward: result.reward, feePackage: result.feePackage });
     return;
   }
 
@@ -419,6 +428,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         confirmBroadcast: '/api/agent/:id/confirm',
       },
     });
+    return;
+  }
+
+  // --- Scan for new funding UTXOs ---
+  if (method === 'POST' && url.pathname === '/api/scan-funding') {
+    try {
+      // Use dispatch stats for authoritative balance (combines on-chain + internal UTXOs)
+      const stats = dispatch ? await dispatch.getUnifiedStats() : null;
+      const balance = stats?.walletBalanceSats ?? await network.getBalance(wallet.address);
+      json(res, { balance, address: wallet.address });
+    } catch (err: any) {
+      json(res, { balance: 0, address: wallet.address, error: err.message });
+    }
     return;
   }
 
