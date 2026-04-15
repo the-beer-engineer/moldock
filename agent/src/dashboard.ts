@@ -808,11 +808,13 @@ async function toggleBrowserAgent() {
 }
 
 // Local queue of pre-fetched work packages. Refilled in batches to amortize Cloudflare RTT.
-// With PARALLEL_CHAINS=5 workers, we want to keep the queue topped up.
 let workQueue = [];
-const WORK_BATCH_SIZE = 10;
+const WORK_BATCH_SIZE = 5;
+let fetchInFlight = false; // prevent multiple simultaneous fetches from parallel workers
 
 async function fetchWorkBatch() {
+  if (fetchInFlight) return; // coordinator — one fetch at a time
+  fetchInFlight = true;
   try {
     const r = await fetch('/api/agent/' + browserAgentId + '/work?count=' + WORK_BATCH_SIZE);
     if (!r.ok) return;
@@ -824,6 +826,8 @@ async function fetchWorkBatch() {
     }
   } catch (e) {
     console.warn('fetchWorkBatch failed:', e);
+  } finally {
+    fetchInFlight = false;
   }
 }
 
@@ -961,7 +965,8 @@ async function broadcastChainBrowser(stepTxs) {
 // Number of molecules to process in parallel per browser tab.
 // Each chain is internally sequential (no intra-chain races) but multiple
 // chains run concurrently to amortize Cloudflare RTT and keep Arcade busy.
-const PARALLEL_CHAINS = 5;
+// 3 works well — more causes Arcade contention and wasted genesis TXs.
+const PARALLEL_CHAINS = 3;
 
 async function browserWorkLoop(myToken) {
   // Spawn N parallel workers — each pulls work from the shared queue,

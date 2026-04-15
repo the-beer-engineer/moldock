@@ -587,6 +587,37 @@ export class DispatchManager {
     return this.agentsByName.has(name.toLowerCase());
   }
 
+  /**
+   * Clean up stale work items from the in-memory work map.
+   * - Verified/pass/fail work older than 10 min → removed (browsers won't re-submit)
+   * - Assigned work older than WORK_TIMEOUT_MS (30 min) with no progress → removed
+   * This prevents unbounded memory growth and keeps the chain verification ticker fast.
+   */
+  cleanupStaleWork(): { removed: number; remaining: number } {
+    const now = Date.now();
+    const TERMINAL_TTL = 10 * 60 * 1000; // 10 min after complete
+    let removed = 0;
+    for (const [id, work] of this.work.entries()) {
+      const assignedAt = new Date(work.assignedAt).getTime();
+      const age = now - assignedAt;
+      // Terminal states: clean up after TERMINAL_TTL
+      if ((work.status === 'verified' || work.status === 'pass' || work.status === 'fail') && age > TERMINAL_TTL) {
+        this.work.delete(id);
+        removed++;
+        continue;
+      }
+      // Stuck assigned work: clean up after WORK_TIMEOUT_MS
+      if (work.status === 'assigned' && age > WORK_TIMEOUT_MS) {
+        this.work.delete(id);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      console.log(`[dispatch] Cleaned up ${removed} stale work items (${this.work.size} remaining)`);
+    }
+    return { removed, remaining: this.work.size };
+  }
+
   // --- Work Distribution ---
 
   /** Enqueue pre-built work items from dashboard-initiated jobs */

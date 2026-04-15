@@ -469,6 +469,13 @@ server.listen(PORT, async () => {
     }
   }, 15000);
   console.log(`[server] Chain verification ticker enabled (15s)`);
+
+  // Stale work cleanup ticker — every 2 min, remove completed/abandoned work from memory
+  setInterval(() => {
+    if (!dispatch) return;
+    try { dispatch.cleanupStaleWork(); } catch (err: any) { console.error(`[cleanup] error: ${err.message}`); }
+  }, 2 * 60 * 1000);
+  console.log(`[server] Stale work cleanup ticker enabled (2 min)`);
 });
 
 function sleep(ms: number): Promise<void> {
