@@ -1141,7 +1141,7 @@ export class DispatchManager {
     const workItems = [...this.work.values()];
     return {
       totalAgents: agents.length,
-      activeAgents: agents.filter(a => a.currentWorkId || (Date.now() - new Date(a.lastSeen).getTime() < 60000)).length,
+      activeAgents: agents.filter(a => (Date.now() - new Date(a.lastSeen).getTime() < 60000)).length,
       totalWorkCreated: workItems.length,
       totalPassed: workItems.filter(w => w.status === 'pass' || w.status === 'verified').length,
       totalFailed: workItems.filter(w => w.status === 'fail').length,
@@ -1249,7 +1249,7 @@ export class DispatchManager {
 
     return {
       totalAgents: agents.length,
-      activeAgents: agents.filter(a => a.currentWorkId || (Date.now() - new Date(a.lastSeen).getTime() < 60000)).length,
+      activeAgents: agents.filter(a => (Date.now() - new Date(a.lastSeen).getTime() < 60000)).length,
       processed: totalProcessed,
       passed: totalPassed,
       failed: totalFailed,
@@ -1298,12 +1298,14 @@ export class DispatchManager {
     registeredAt: string;
   }> {
     const now = Date.now();
-    const OFFLINE_MS = 5 * 60 * 1000; // 5 min
+    const WORKING_MS = 60 * 1000;     // within 60s = actively working
+    const OFFLINE_MS = 5 * 60 * 1000; // > 5 min = offline
     return [...this.agents.values()].map(a => {
+      const sinceLastSeen = now - new Date(a.lastSeen).getTime();
       let status: string;
-      if (a.currentWorkId) {
+      if (sinceLastSeen < WORKING_MS) {
         status = 'working';
-      } else if (now - new Date(a.lastSeen).getTime() < OFFLINE_MS) {
+      } else if (sinceLastSeen < OFFLINE_MS) {
         status = 'idle';
       } else {
         status = 'offline';

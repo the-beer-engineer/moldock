@@ -657,6 +657,7 @@ async function toggleBrowserAgent() {
   if (browserAgentRunning) {
     browserAgentRunning = false;
     $('start-btn').textContent = 'Start Computing';
+    $('start-btn').className = 'stop-btn';  // will be overridden below
     $('start-btn').className = 'start-btn';
     $('agent-inputs').style.display = 'flex';
     $('ba-status').textContent = 'stopped';
@@ -664,6 +665,14 @@ async function toggleBrowserAgent() {
     if (nameDisplayStop) nameDisplayStop.textContent = '';
     // Clear sessionStorage so we don't auto-restart on reload
     try { sessionStorage.removeItem('moldock_agent_running'); } catch {}
+    // Release the wake lock
+    try {
+      if (window.__moldockWakeLock) {
+        await window.__moldockWakeLock.release();
+        window.__moldockWakeLock = null;
+        console.log('[wake-lock] released');
+      }
+    } catch {}
     baLog('Agent stopped.', '#ff6644');
     return;
   }
@@ -719,6 +728,29 @@ async function toggleBrowserAgent() {
     console.log('[autoStart] saved to sessionStorage:', data);
   } catch (e) {
     console.warn('[autoStart] save failed:', e);
+  }
+
+  // Request Screen Wake Lock to prevent browser from throttling/sleeping the tab
+  // when the screen turns off. Without this, mobile & Mac browsers pause JS.
+  try {
+    if ('wakeLock' in navigator) {
+      const lock = await navigator.wakeLock.request('screen');
+      window.__moldockWakeLock = lock;
+      console.log('[wake-lock] acquired');
+      // Re-request on visibility change (lock is released when tab hides)
+      document.addEventListener('visibilitychange', async () => {
+        if (document.visibilityState === 'visible' && browserAgentRunning) {
+          try {
+            window.__moldockWakeLock = await navigator.wakeLock.request('screen');
+            console.log('[wake-lock] re-acquired');
+          } catch (e) { console.warn('[wake-lock] re-request failed', e); }
+        }
+      });
+    } else {
+      console.log('[wake-lock] API not available');
+    }
+  } catch (e) {
+    console.warn('[wake-lock] failed:', e);
   }
 
   // Generate session keypair
