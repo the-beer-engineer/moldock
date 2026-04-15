@@ -156,8 +156,9 @@ export class ArcAdapter implements NetworkAdapter {
     // Arcade requires Extended Format (EF) — includes source TX data inline.
     const efHex = tx.toHexEF();
     const body = Buffer.from(efHex, 'hex');
-    const TIMEOUT_MS = 5000;  // 5s per attempt (was 15s)
-    const MAX_ATTEMPTS = 3;   // total budget: 3 × 5s = 15s, fits within browser's 30s /pass timeout
+    const TIMEOUT_MS = 4000;  // 4s per attempt
+    const MAX_ATTEMPTS = 2;   // total budget: 2 × 4s = 8s per walletTxWithRollback attempt
+                              // walletTxWithRollback does 2 attempts with different UTXOs = 16s max
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       for (const endpoint of this.endpoints) {

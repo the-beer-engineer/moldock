@@ -474,15 +474,22 @@ function trustBadge(level){
 const nameColors=['#00ccff','#00ff88','#ffaa00','#ff6699','#aa88ff','#88ddff','#44ffaa','#ffcc44'];
 
 // ========== Dashboard Refresh ==========
+let _refreshInFlight = false;
 async function refresh(){
+  if (_refreshInFlight) return; // prevent overlap
+  _refreshInFlight = true;
   try{
-    const[stats,agents,events,results,node]=await Promise.all([
-      fetch('/api/stats').then(r=>r.json()),
-      fetch('/api/agents').then(r=>r.json()),
-      fetch('/api/events').then(r=>r.json()),
-      fetch('/api/results').then(r=>r.json()),
-      fetch('/api/node').then(r=>r.json()).catch(()=>({status:'disconnected'})),
-    ]);
+    // Single combined endpoint — 1 fetch instead of 5.
+    // 5s timeout so stalled refreshes don't block subsequent ones.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const data = await fetch('/api/dashboard-data', { signal: ctrl.signal }).then(r=>r.json());
+    clearTimeout(timer);
+    const stats = data.stats || {};
+    const agents = data.agents || [];
+    const events = data.events || [];
+    const results = data.results || [];
+    const node = data.node || { status: 'disconnected' };
 
     // Node status
     const network = stats.network || 'regtest';
@@ -606,6 +613,7 @@ async function refresh(){
     }).join('');
 
   }catch(e){console.error('refresh',e)}
+  finally { _refreshInFlight = false; }
 }
 // Refresh cadence: 2s when visible, 10s when hidden.
 // Was 500ms which saturated Cloudflare tunnel at 10 req/sec × N tabs.

@@ -349,7 +349,7 @@ export class DispatchManager {
     build: (picked: { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number }) => Promise<{ tx: Transaction; walletOuts: number[]; result: T }>,
     minSats: number,
   ): Promise<{ tx: Transaction; txid: string; result: T }> {
-    const MAX_ATTEMPTS = 3;
+    const MAX_ATTEMPTS = 2; // budget: 2 × ~8s Arcade = ~16s, fits in browser 30s /pass timeout
     let lastErr: any;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {

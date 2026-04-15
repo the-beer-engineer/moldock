@@ -229,6 +229,36 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // Combined dashboard data — one call replaces 5 separate fetches.
+  // Reduces Cloudflare tunnel load by 5× for the dashboard refresh loop.
+  if (method === 'GET' && url.pathname === '/api/dashboard-data') {
+    if (!dispatch) { json(res, { status: 'initializing' }); return; }
+    try {
+      const ds = await dispatch.getUnifiedStats();
+      let blockHeight = 0;
+      try { blockHeight = await network.getBlockHeight(); } catch {}
+      const stopCheck = await dispatch.shouldStop();
+      json(res, {
+        stats: {
+          status: stopCheck.stop ? 'completed' : (ds.totalAgents > 0 ? 'running' : 'waiting'),
+          stopReason: stopCheck.stop ? stopCheck.reason : null,
+          ...ds,
+          blockHeight,
+          totalBountiesPosted,
+          network: config.network,
+          dispatchWallet: wallet.address,
+        },
+        agents: dispatch.getAgentsForDashboard(),
+        events: dispatch.getRecentEvents(),
+        results: dispatch.getResults(),
+        node: { status: 'connected', height: blockHeight },
+      });
+    } catch (err: any) {
+      json(res, { error: err.message }, 500);
+    }
+    return;
+  }
+
   // --- Agent Registration ---
   if (method === 'POST' && url.pathname === '/api/agent/register') {
     if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
