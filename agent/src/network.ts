@@ -49,16 +49,16 @@ export interface NetworkAdapter {
 // ARC endpoints
 // ---------------------------------------------------------------------------
 // Arcade endpoints — requires Extended Format (EF) for broadcast.
-// GorillaPool ARC accepts raw but never relays to miners; Arcade with EF works.
+// Ordered by observed speed (fastest first) — arcade-us-1 has been flaky under load.
 const ARC_ENDPOINTS: Record<'testnet' | 'mainnet', string[]> = {
   testnet: [
     'https://arcade-testnet-us-1.bsvb.tech',
     'https://arcade-ttn-us-1.bsvb.tech',
   ],
   mainnet: [
-    'https://arcade-us-1.bsvb.tech',
     'https://arcade-eu-1.bsvb.tech',
     'https://arcade-ttn-us-1.bsvb.tech',
+    'https://arcade-us-1.bsvb.tech',
   ],
 };
 
@@ -156,9 +156,8 @@ export class ArcAdapter implements NetworkAdapter {
     // Arcade requires Extended Format (EF) — includes source TX data inline.
     const efHex = tx.toHexEF();
     const body = Buffer.from(efHex, 'hex');
-    const TIMEOUT_MS = 4000;  // 4s per attempt
-    const MAX_ATTEMPTS = 2;   // total budget: 2 × 4s = 8s per walletTxWithRollback attempt
-                              // walletTxWithRollback does 2 attempts with different UTXOs = 16s max
+    const TIMEOUT_MS = 8000;  // 8s per attempt — arcade-us-1 can be slow
+    const MAX_ATTEMPTS = 2;   // 2 × 3 endpoints × 8s = up to 48s worst case, usually much less
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       for (const endpoint of this.endpoints) {

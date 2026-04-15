@@ -280,15 +280,18 @@ export class DispatchManager {
       if (now - t > BLACKLIST_TTL) this._failedUtxos.delete(k);
     }
     const allUtxos = this.dispatchWallet.getUtxos().filter(u => u.sourceTransaction);
+    // Prefer LARGER UTXOs first — fan-out outputs (~300K sats) are likely to have
+    // confirmed parents. Small change outputs (~100-1K sats) are more likely from
+    // deep unconfirmed chains that Arcade rejects.
     let available = allUtxos
       .filter(u => !this._failedUtxos.has(`${u.txid}:${u.vout}`))
-      .sort((a, b) => a.satoshis - b.satoshis);
+      .sort((a, b) => b.satoshis - a.satoshis); // largest first
 
     // Safety valve: if blacklist ate everything, clear it and retry
     if (available.length === 0 && allUtxos.length > 0) {
       console.log(`[dispatch] All ${allUtxos.length} UTXOs blacklisted — clearing blacklist`);
       this._failedUtxos.clear();
-      available = allUtxos.sort((a, b) => a.satoshis - b.satoshis);
+      available = allUtxos.sort((a, b) => b.satoshis - a.satoshis);
     }
     if (available.length === 0) return null;
 
@@ -360,58 +363,58 @@ export class DispatchManager {
     let lastErr: any;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      // Phase 1: pick + sign + optimistically add change (all under lock)
-      let phase1: { tx: Transaction; walletOuts: number[]; result: T; snapshots: UTXO[]; addedOuts: Array<{txid:string; vout:number}> } | null = null;
-      let pickFailed = false;
+      // Phase 1: pick + sign + mark spent (all under lock)
+      // DO NOT add change optimistically — broken-broadcast rollback races with
+      // persistState's 2s debounce and creates ghost UTXOs on disk.
+      let phase1: { tx: Transaction; walletOuts: number[]; result: T; snapshots: UTXO[] } | null = null;
       try {
         phase1 = await this.withSpendLock(async () => {
           const picked = this.pickWalletUtxos(minSats);
           if (!picked) throw new Error(`NO_FUNDING:${minSats}`);
           const snapshots = picked.utxos.map(u => ({ ...u }));
           const { tx, walletOuts, result } = await build(picked);
-          // Mark spent
           for (const u of picked.utxos) this.dispatchWallet.spendUtxo(u.txid, u.vout);
-          // OPTIMISTICALLY add change UTXO under the lock — prevents transient wallet
-          // exhaustion while the broadcast is in flight. Rolled back on broadcast failure.
-          const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
-          const txid = tx.id('hex');
-          const addedOuts: Array<{txid:string; vout:number}> = [];
-          for (const idx of walletOuts) {
-            const out = tx.outputs[idx];
-            if (out && out.satoshis && out.satoshis > 0) {
-              this.dispatchWallet.addUtxo({
-                txid, vout: idx, satoshis: out.satoshis,
-                script: p2pkHex, sourceTransaction: tx,
-              });
-              addedOuts.push({ txid, vout: idx });
-            }
-          }
-          return { tx, walletOuts, result, snapshots, addedOuts };
+          return { tx, walletOuts, result, snapshots };
         });
       } catch (err: any) {
         lastErr = err;
         if (String(err?.message || '').startsWith('NO_FUNDING')) {
           // Wallet is transiently exhausted (other in-flight TXs). Wait and retry.
-          pickFailed = true;
           if (attempt < MAX_ATTEMPTS - 1) {
-            await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+            await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
             continue;
           }
           throw new Error(`No funding available (need ${minSats} sats, have ${this.dispatchWallet.balance})`);
         }
         throw err;
       }
-      if (pickFailed || !phase1) continue;
+      if (!phase1) continue;
 
-      const { tx, result, snapshots, addedOuts } = phase1;
+      const { tx, walletOuts, result, snapshots } = phase1;
 
       // Phase 2: broadcast (outside lock)
       try {
         const txid = await this.network.broadcast(tx);
+
+        // Phase 3: add change UTXO AFTER successful broadcast
+        if (walletOuts.length > 0) {
+          await this.withSpendLock(async () => {
+            const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
+            for (const idx of walletOuts) {
+              const out = tx.outputs[idx];
+              if (out && out.satoshis && out.satoshis > 0) {
+                this.dispatchWallet.addUtxo({
+                  txid, vout: idx, satoshis: out.satoshis,
+                  script: p2pkHex, sourceTransaction: tx,
+                });
+              }
+            }
+          });
+        }
+
         return { tx, txid, result };
       } catch (err: any) {
         lastErr = err;
-        // Only blacklist UTXOs when the error is UTXO-specific.
         const errMsg = String(err?.message || '');
         const isUtxoSpecific = /failed to validate|missing|unknown.*input|previous|parent/i.test(errMsg);
         if (isUtxoSpecific) {
@@ -420,11 +423,8 @@ export class DispatchManager {
             this._failedUtxos.set(`${snap.txid}:${snap.vout}`, now);
           }
         }
-        // Rollback: remove the optimistically-added outputs AND restore spent inputs
+        // Rollback: restore spent UTXOs (no optimistic change to remove)
         await this.withSpendLock(async () => {
-          for (const out of addedOuts) {
-            this.dispatchWallet.spendUtxo(out.txid, out.vout);
-          }
           for (const snap of snapshots) {
             this.dispatchWallet.addUtxo(snap);
           }
