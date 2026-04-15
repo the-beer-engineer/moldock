@@ -294,24 +294,37 @@ function showMolModal(jsonStrOrEl) {
 
   function tryAutoStart() {
     const saved = sessionStorage.getItem(RUNNING_KEY);
+    console.log('[autoStart] sessionStorage check:', saved);
     if (!saved) return;
     try {
       const { name, address } = JSON.parse(saved);
       const nameInput = document.getElementById('ba-name');
       const addrInput = document.getElementById('ba-paymail');
       const startBtn = document.getElementById('start-btn');
+      console.log('[autoStart] elements found:', { nameInput: !!nameInput, addrInput: !!addrInput, startBtn: !!startBtn, name });
       if (nameInput && addrInput && startBtn && name) {
         nameInput.value = name;
         if (address) addrInput.value = address;
-        setTimeout(() => {
-          if (typeof window.toggleBrowserAgent === 'function') {
+        // Wait for module script to run + BSV SDK to load (top-level await suspends module).
+        // Keep polling until window.toggleBrowserAgent is defined, then click.
+        let waitedMs = 0;
+        const poll = setInterval(() => {
+          if (typeof window.toggleBrowserAgent === 'function' && window.BSV) {
+            clearInterval(poll);
+            console.log('[autoStart] firing toggleBrowserAgent for', name);
             window.toggleBrowserAgent();
           } else {
-            setTimeout(tryAutoStart, 1000);
+            waitedMs += 250;
+            if (waitedMs >= 30000) {
+              clearInterval(poll);
+              console.warn('[autoStart] gave up after 30s — toggleBrowserAgent or BSV not ready');
+            }
           }
-        }, 1500);
+        }, 250);
       }
-    } catch {}
+    } catch (e) {
+      console.error('[autoStart] error:', e);
+    }
   }
 
   // sessionStorage save now happens directly inside toggleBrowserAgent;
@@ -357,6 +370,8 @@ let BSV = null;
 try {
   BSV = await import('https://esm.sh/@bsv/sdk@1.10.1');
   window.__bsv = BSV;
+  window.BSV = BSV; // for autoStart watchdog
+  console.log('[browser-agent] BSV SDK loaded');
 } catch (err) {
   console.warn('[browser-agent] Failed to load @bsv/sdk from CDN:', err);
 }
@@ -699,8 +714,12 @@ async function toggleBrowserAgent() {
   if (nameDisplay) nameDisplay.textContent = '— ' + agentName;
   // Save state for auto-restart on page reload (per-tab via sessionStorage)
   try {
-    sessionStorage.setItem('moldock_agent_running', JSON.stringify({ name: agentName, address: paymail || '' }));
-  } catch {}
+    const data = JSON.stringify({ name: agentName, address: paymail || '' });
+    sessionStorage.setItem('moldock_agent_running', data);
+    console.log('[autoStart] saved to sessionStorage:', data);
+  } catch (e) {
+    console.warn('[autoStart] save failed:', e);
+  }
 
   // Generate session keypair
   browserPrivKey = BSV.PrivateKey.fromRandom();
@@ -829,7 +848,7 @@ async function broadcastChainBrowser(stepTxs) {
     // for load balancing. Parallel waves of N — TXs depend on each other but Arcade is
     // generally OK accepting them slightly out of order with a brief retry on "missing parent".
     const ARCADE_ENDPOINTS = browserArcEndpoints;
-    const WAVE = 4; // concurrent broadcasts per wave
+    const WAVE = 1; // sequential — chain TXs depend on each other; parallel races cause REJECTED cascades
     let endpointIdx = 0;
 
     async function sendOne(efHex, idx) {
@@ -842,17 +861,25 @@ async function broadcastChainBrowser(stepTxs) {
             headers: { 'Content-Type': 'application/octet-stream' },
             body: body,
           });
-          if (r.ok) return null;
-          const errText = await r.text();
-          // 5xx (SQLITE_BUSY) or "missing parent" — retry with backoff
-          if (r.status >= 500 || /missing|unknown|previous/i.test(errText)) {
-            if (attempt < 5) {
-              const waitMs = 150 + Math.random() * 300 * Math.pow(2, attempt);
-              await new Promise(res => setTimeout(res, waitMs));
-              continue;
-            }
+          // Parse body — Arcade returns HTTP 200 even on REJECTED status
+          const respText = await r.text();
+          let respJson = null;
+          try { respJson = JSON.parse(respText); } catch {}
+          const txStatus = respJson?.txStatus || '';
+          const isOk = r.ok && txStatus !== 'REJECTED' && !respJson?.error;
+          if (isOk) return null;
+
+          const errMsg = respJson?.extraInfo || respJson?.detail || respJson?.error || respText.slice(0, 200);
+          // 5xx (SQLITE_BUSY) or "missing parent"/REJECTED — retry with backoff
+          const isRetryable = r.status >= 500
+            || txStatus === 'REJECTED'
+            || /missing|unknown|previous|not found|sqlite|busy/i.test(errMsg);
+          if (isRetryable && attempt < 5) {
+            const waitMs = 200 + Math.random() * 400 * Math.pow(2, attempt);
+            await new Promise(res => setTimeout(res, waitMs));
+            continue;
           }
-          return { error: 'Arcade ' + r.status + ': ' + errText.slice(0, 200) };
+          return { error: 'Arcade ' + r.status + '/' + (txStatus || 'err') + ': ' + errMsg.slice(0, 150) };
         } catch (e) {
           if (attempt < 5) {
             await new Promise(res => setTimeout(res, 300 * (attempt + 1)));

@@ -172,25 +172,31 @@ export class ArcAdapter implements NetworkAdapter {
           });
           clearTimeout(timer);
 
-          if (response.ok) {
-            const data = await response.json() as any;
-            return data.txid || tx.id('hex');
+          // Arcade returns HTTP 200 even for REJECTED — must check txStatus in body
+          const respText = await response.text();
+          let respJson: any = null;
+          try { respJson = JSON.parse(respText); } catch {}
+          const txStatus = respJson?.txStatus || '';
+          const isAccepted = response.ok && txStatus !== 'REJECTED' && !respJson?.error;
+
+          if (isAccepted) {
+            return respJson?.txid || tx.id('hex');
           }
 
-          const errorText = await response.text();
+          const errorMsg = respJson?.extraInfo || respJson?.detail || respJson?.error || respText.slice(0, 200);
 
           // 4xx client errors (except 429) — don't retry, throw immediately
           if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-            throw new Error(`Arcade ${response.status}: ${errorText}`);
+            throw new Error(`Arcade ${response.status}: ${errorMsg}`);
           }
 
-          // 5xx / 429 — retry with backoff
+          // 5xx / 429 / REJECTED — retry with backoff
           if (attempt < MAX_ATTEMPTS) {
             const waitMs = 200 + Math.random() * 500 * Math.pow(2, attempt - 1);
             await sleep(Math.min(waitMs, 5000));
             continue;
           }
-          throw new Error(`Arcade ${response.status}: ${errorText}`);
+          throw new Error(`Arcade ${txStatus || response.status}: ${errorMsg}`);
         } catch (err: any) {
           clearTimeout(timer);
           if (err.message?.startsWith('Arcade 4')) throw err;
