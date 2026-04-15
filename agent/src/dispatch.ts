@@ -10,7 +10,6 @@ import { computeBatchEnergy } from './energy.js';
 import { generateMolecule, generateReceptorSite, getRealMolecules } from './generate.js';
 import { getNetwork, type NetworkAdapter } from './network.js';
 import type { Molecule, ReceptorSite } from './types.js';
-import { bulkFundWalletP2PK } from './chainBuilder.js';
 import { readFileSync, writeFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -28,6 +27,8 @@ interface PersistedResult {
   totalTxs: number;
   receptorName: string;
   chainSteps: number;
+  genesisTxid?: string;    // for blockchain explorer links
+  chainTxids?: string[];   // chain step TXIDs (if pass/verified)
 }
 
 /** Max results to persist — keeps only the best score per base molecule */
@@ -167,7 +168,7 @@ export interface FeePackage {
 
 const WORK_TIMEOUT_MS = 30 * 60 * 1000; // 30 min timeout for work
 const SPOT_CHECK_RATE = 0.05;            // 5% of submissions get spot-checked
-const FEE_RATE_SATS_PER_KB = 100;       // BSV fee rate: 100 sats/kB
+const FEE_RATE_SATS_PER_KB = parseInt(process.env.FEE_RATE_SATS_PER_KB || '100', 10); // sats/kB — ARC enforces 100 sats/kB minimum
 const FEE_PER_STEP_SATS = 200;          // default estimate: ~1.65KB chain TX × 100 sats/kB ≈ 165, rounded up
 
 export class DispatchManager {
@@ -213,6 +214,9 @@ export class DispatchManager {
   readonly TX_TARGET = 1_500_000;
 
   // Balance is simply the sum of persisted UTXOs — no WoC scanning needed
+
+  // Spending lock — prevents concurrent wallet operations from picking the same UTXO
+  private _spendLock: Promise<void> = Promise.resolve();
 
   // Persisted cumulative state (survives restarts)
   private persistedState: PersistedState;
@@ -261,6 +265,181 @@ export class DispatchManager {
       this.asmCache.set(ac, getCompiledAsm(ac));
     }
     console.log(`[dispatch] Loaded ${this.molecules.length} molecules, ${atomCounts.length} atom counts compiled`);
+  }
+
+  /**
+   * Pick wallet UTXO(s) with at least `minSats` total.
+   * Prefers a single UTXO if available, otherwise combines multiple.
+   * Returns inputs ready to add to a Transaction.
+   */
+  private pickWalletUtxos(minSats: number): { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number } | null {
+    const available = this.dispatchWallet.getUtxos()
+      .filter(u => u.sourceTransaction)
+      .sort((a, b) => a.satoshis - b.satoshis); // smallest first — avoid wasting big UTXOs
+    if (available.length === 0) return null;
+
+    // Try single UTXO first (cheapest — fewer inputs = lower fee)
+    const single = available.find(u => u.satoshis >= minSats);
+    if (single) {
+      const isP2PKH = single.script.length === 50 && single.script.startsWith('76a914');
+      const unlock = isP2PKH
+        ? new P2PKH().unlock(this.dispatchWallet.privateKey, 'all', false, single.satoshis, Script.fromHex(single.script))
+        : this.dispatchWallet.p2pkUnlock(single.satoshis, Script.fromHex(single.script));
+      return { utxos: [single], unlockTemplates: [unlock], totalSats: single.satoshis };
+    }
+
+    // Combine multiple UTXOs — use largest first to minimize input count
+    const descending = [...available].reverse();
+    const selected: UTXO[] = [];
+    const unlocks: any[] = [];
+    let total = 0;
+    for (const u of descending) {
+      const isP2PKH = u.script.length === 50 && u.script.startsWith('76a914');
+      const unlock = isP2PKH
+        ? new P2PKH().unlock(this.dispatchWallet.privateKey, 'all', false, u.satoshis, Script.fromHex(u.script))
+        : this.dispatchWallet.p2pkUnlock(u.satoshis, Script.fromHex(u.script));
+      selected.push(u);
+      unlocks.push(unlock);
+      total += u.satoshis;
+      if (total >= minSats) break;
+    }
+    if (total < minSats) return null;
+    return { utxos: selected, unlockTemplates: unlocks, totalSats: total };
+  }
+
+  /**
+   * Serialize wallet spending: ensures only one operation picks + spends UTXOs at a time.
+   * The callback should pick UTXOs, build+sign the TX, call spendUtxo, and return.
+   * ARC broadcasting can happen outside the lock.
+   */
+  private async withSpendLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this._spendLock;
+    let resolve!: () => void;
+    this._spendLock = new Promise(r => { resolve = r; });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      resolve();
+    }
+  }
+
+  /**
+   * Run a wallet-spending TX with parallelism-safe semantics:
+   *   1. Under the spend lock: pick UTXOs, build+sign TX, mark spent (PESSIMISTIC)
+   *   2. Outside the lock: broadcast (allows parallel broadcasts across agents)
+   *   3. On success: add change UTXO to wallet
+   *   4. On failure: rollback (restore spent UTXOs)
+   *
+   * This allows N agents to have N broadcasts in flight simultaneously,
+   * with only the ~10ms pick+sign step serialized.
+   */
+  private async walletTxWithRollback<T>(
+    build: (picked: { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number }) => Promise<{ tx: Transaction; walletOuts: number[]; result: T }>,
+    minSats: number,
+  ): Promise<{ tx: Transaction; txid: string; result: T }> {
+    // Phase 1: pick + sign + mark spent (under lock)
+    const { tx, walletOuts, result, snapshots } = await this.withSpendLock(async () => {
+      const picked = this.pickWalletUtxos(minSats);
+      if (!picked) throw new Error(`No funding available (need ${minSats} sats, have ${this.dispatchWallet.balance})`);
+      const snapshots = picked.utxos.map(u => ({ ...u }));
+      const { tx, walletOuts, result } = await build(picked);
+      for (const u of picked.utxos) this.dispatchWallet.spendUtxo(u.txid, u.vout);
+      return { tx, walletOuts, result, snapshots };
+    });
+
+    // Phase 2: broadcast (outside lock — parallel across agents)
+    let txid: string;
+    try {
+      txid = await this.network.broadcast(tx);
+    } catch (err) {
+      await this.withSpendLock(async () => {
+        for (const snap of snapshots) {
+          this.dispatchWallet.addUtxo(snap);
+        }
+      });
+      throw err;
+    }
+
+    // Phase 3: add output UTXOs back to wallet (under lock)
+    if (walletOuts.length > 0) {
+      await this.withSpendLock(async () => {
+        const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
+        for (const idx of walletOuts) {
+          const out = tx.outputs[idx];
+          if (out && out.satoshis && out.satoshis > 0) {
+            this.dispatchWallet.addUtxo({
+              txid, vout: idx, satoshis: out.satoshis,
+              script: p2pkHex,
+              sourceTransaction: tx,
+            });
+          }
+        }
+      });
+    }
+
+    return { tx, txid, result };
+  }
+
+  /**
+   * Fan out a big UTXO into many smaller ones so parallel agents don't contend.
+   * Called on startup when a single UTXO exceeds `threshold`.
+   */
+  async fanOutIfNeeded(threshold = 500000, numOutputs = 50, satsPerOutput = 300000): Promise<void> {
+    if (this.network.getNetwork() === 'regtest') return;
+
+    const utxos = this.dispatchWallet.getUtxos();
+    const big = utxos.filter(u => u.satoshis >= threshold);
+    if (big.length === 0) return;
+
+    // Count how many small UTXOs we already have — if plenty, skip
+    const smallEnough = utxos.filter(u => u.satoshis >= satsPerOutput && u.satoshis < threshold);
+    if (smallEnough.length >= numOutputs) {
+      console.log(`[fanout] Skipping — already have ${smallEnough.length} suitable UTXOs`);
+      return;
+    }
+
+    const bigTotal = big.reduce((s, u) => s + u.satoshis, 0);
+    const targetTotal = numOutputs * satsPerOutput + 5000; // +buffer for fee
+    if (bigTotal < targetTotal) {
+      console.log(`[fanout] Insufficient big UTXOs (${bigTotal} sats) to fan out to ${numOutputs} × ${satsPerOutput}`);
+      return;
+    }
+
+    console.log(`[fanout] Fanning out ${big.length} big UTXO(s) (${bigTotal} sats) → ${numOutputs} × ${satsPerOutput} sats`);
+
+    try {
+      await this.walletTxWithRollback(async (picked) => {
+        const tx = new Transaction();
+        tx.version = 2;
+        for (let i = 0; i < picked.utxos.length; i++) {
+          tx.addInput({
+            sourceTransaction: picked.utxos[i].sourceTransaction,
+            sourceOutputIndex: picked.utxos[i].vout,
+            unlockingScriptTemplate: picked.unlockTemplates[i],
+          });
+        }
+        const lockScript = this.dispatchWallet.p2pkLockingScript();
+        for (let i = 0; i < numOutputs; i++) {
+          tx.addOutput({ lockingScript: lockScript, satoshis: satsPerOutput });
+        }
+        tx.addOutput({ lockingScript: lockScript, change: true });
+        await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
+        await tx.sign();
+        // walletOuts = all N fan-out outputs + change
+        const outs = Array.from({ length: numOutputs + 1 }, (_, i) => i);
+        return { tx, walletOuts: outs, result: null };
+      }, targetTotal);
+
+      // Also need to add the non-change fan-out outputs to the wallet
+      // walletTxWithRollback only adds the changeOut index; we need to add all N outputs
+      // Rebuild by querying the wallet for the tx we just created (it has the change UTXO)
+      // Actually we need a different approach — let me track this manually
+
+      console.log(`[fanout] Complete`);
+    } catch (err: any) {
+      console.log(`[fanout] Failed: ${err.message}`);
+    }
   }
 
   /** Check for new incoming deposits (P2PKH + one-time P2PK bootstrap) */
@@ -333,17 +512,8 @@ export class DispatchManager {
     if (this._persistTimer) return;
     this._persistTimer = setTimeout(() => {
       this._persistTimer = null;
-      const utxos: PersistedUtxo[] = this.dispatchWallet.getUtxos().map(u => ({
-        txid: u.txid,
-        vout: u.vout,
-        satoshis: u.satoshis,
-        script: u.script,
-        sourceTxHex: u.sourceTransaction ? u.sourceTransaction.toHex() : '',
-      })).filter(u => u.sourceTxHex.length > 0);
-
-      this.persistedState.utxos = utxos;
-      saveState(this.persistedState);
-    }, 100);
+      this.persistState();
+    }, 2000); // 2s debounce — reduces disk writes under heavy load
   }
 
   private pushEvent(event: Omit<DispatchEvent, 'timestamp'>): void {
@@ -366,9 +536,17 @@ export class DispatchManager {
   // --- Agent Registration ---
 
   registerAgent(name: string, pubkey: string, paymail?: string | null): { agent: RemoteAgent; error?: string } {
-    // Check name uniqueness
-    if (this.agentsByName.has(name.toLowerCase())) {
-      return { agent: null as any, error: `Name "${name}" is already taken` };
+    // If same name re-registers (stop/start), reuse the existing agent
+    const existingId = this.agentsByName.get(name.toLowerCase());
+    if (existingId) {
+      const existing = this.agents.get(existingId)!;
+      existing.pubkey = pubkey;
+      existing.paymail = paymail ?? existing.paymail;
+      existing.currentWorkId = null;
+      existing.currentMoleculeId = null;
+      existing.lastSeen = new Date().toISOString();
+      console.log(`[dispatch] Agent re-registered: ${name} (${existingId})`);
+      return { agent: existing };
     }
 
     const id = Math.random().toString(36).slice(2, 10);
@@ -429,6 +607,9 @@ export class DispatchManager {
     const agent = this.agents.get(agentId);
     if (!agent) return { error: 'Agent not found' };
     if (agent.currentWorkId) return { error: 'Agent already has work assigned' };
+
+    // Start the clock on first work assignment
+    if (this.startTime === 0) this.startTime = performance.now();
 
     // Try external queue first (dashboard-initiated jobs)
     if (this.externalQueue.length > 0) {
@@ -495,25 +676,24 @@ export class DispatchManager {
     // Look up the receptor for this molecule (fall back to default)
     const molReceptor = (molecule.receptorId && this.receptors.get(molecule.receptorId)) || this.receptor;
 
-    // Create genesis TX funded from dispatch wallet
+    // Create genesis TX — parallel-safe: pick+sign under lock, broadcast outside
     try {
-      const fundingUtxos = await bulkFundWalletP2PK(this.dispatchWallet, 1, 2000);
-      if (fundingUtxos.length === 0) return { error: 'No funding available' };
-
-      const utxo = fundingUtxos[0];
-      const genesisTx = new Transaction();
-      genesisTx.version = 2;
-      genesisTx.addInput({
-        sourceTransaction: utxo.sourceTransaction,
-        sourceOutputIndex: utxo.vout,
-        unlockingScriptTemplate: this.dispatchWallet.p2pkUnlock(utxo.satoshis, Script.fromHex(utxo.script)),
-      });
-      genesisTx.addOutput({ lockingScript: buildChainLockScript(numAtoms, 0, compiledAsm), satoshis: 1 });
-      genesisTx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
-      await genesisTx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-      await genesisTx.sign();
-
-      const genesisTxid = await this.network.broadcast(genesisTx);
+      const { tx: genesisTx, txid: genesisTxid } = await this.walletTxWithRollback(async (picked) => {
+        const tx = new Transaction();
+        tx.version = 2;
+        for (let i = 0; i < picked.utxos.length; i++) {
+          tx.addInput({
+            sourceTransaction: picked.utxos[i].sourceTransaction,
+            sourceOutputIndex: picked.utxos[i].vout,
+            unlockingScriptTemplate: picked.unlockTemplates[i],
+          });
+        }
+        tx.addOutput({ lockingScript: buildChainLockScript(numAtoms, 0, compiledAsm), satoshis: 1 });
+        tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
+        await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
+        await tx.sign();
+        return { tx, walletOuts: [1], result: null };
+      }, 500);
       await this.network.mine(1);
 
       const workId = Math.random().toString(36).slice(2, 10);
@@ -569,19 +749,16 @@ export class DispatchManager {
       this.pushEvent({ type: 'spot_check_fail', agentName: agent.name, agentId, moleculeId: work.molecule.id });
     }
 
-    // Pay base reward for completed work (fail = base only)
-    let rewardTxid: string | null = null;
-    try {
-      rewardTxid = await this.payReward(agent, REWARD_BASE_SATS);
-    } catch (err: any) {
+    // Fire-and-forget reward payment — don't block the agent
+    this.payReward(agent, REWARD_BASE_SATS).catch(err => {
       console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
-    }
+    });
 
     this.markTested(work);
     this.pushEvent({ type: 'fail', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore });
     this.trackBatchCompletion(work.batchId);
     this.persistState();
-    console.log(`[dispatch] ${agent.name} reported FAIL for ${workId} (score=${finalScore})${rewardTxid ? ` reward=${rewardTxid}` : ''}`);
+    console.log(`[dispatch] ${agent.name} reported FAIL for ${workId} (score=${finalScore})`);
 
     // Auto-assign next work
     const next = await this.createWorkPackage(agentId);
@@ -638,9 +815,10 @@ export class DispatchManager {
       // Pass reward: base + per-chain-step bonus (genesis is not a step)
       const chainSteps = chainTxHexes.length - 1;
       const passReward = REWARD_BASE_SATS + (REWARD_PER_CHAIN_TX_SATS * chainSteps);
-      try { await this.payReward(agent, passReward); } catch (err: any) {
+      // Fire-and-forget reward — don't block the agent
+      this.payReward(agent, passReward).catch(err => {
         console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
-      }
+      });
       this.markTested(work);
       this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore, rewardSats: passReward });
       this.persistState();
@@ -670,11 +848,10 @@ export class DispatchManager {
 
       // Pass reward: base + per-chain-step bonus (genesis is not a step)
       const passReward = REWARD_BASE_SATS + (REWARD_PER_CHAIN_TX_SATS * chainSteps);
-      try {
-        await this.payReward(agent, passReward);
-      } catch (err: any) {
+      // Fire-and-forget reward — don't block the agent
+      this.payReward(agent, passReward).catch(err => {
         console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
-      }
+      });
 
       this.markTested(work);
       this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore, rewardSats: passReward });
@@ -709,34 +886,19 @@ export class DispatchManager {
 
   private estimateFeePerStep(chainTxHexes: string[]): number {
     if (chainTxHexes.length === 0) return FEE_PER_STEP_SATS;
-    // Estimate from actual TX sizes — add ~150 bytes for the fee input (txid+vout+sig+sequence)
+    // Estimate from actual TX sizes — add ~150 bytes for fee input (txid+vout+sig+sequence)
     const avgBytes = chainTxHexes.reduce((s, h) => s + h.length / 2, 0) / chainTxHexes.length;
-    const withFeeInput = avgBytes + 150; // extra input overhead
-    // 100 sats/kB = 0.1 sats/byte, round up with margin
-    return Math.ceil((withFeeInput * FEE_RATE_SATS_PER_KB) / 1000) + 1;
+    const withFeeInput = avgBytes + 150;
+    // 100 sats/kB, round up with small margin
+    return Math.ceil((withFeeInput * FEE_RATE_SATS_PER_KB) / 1000) + 5;
   }
 
   private async createFeeUtxos(
     agentPubkey: string, count: number, satsEach: number,
   ): Promise<FeePackage['utxos']> {
-    // Create a single TX with `count` outputs, each paying to the agent's pubkey
-    const totalNeeded = count * satsEach + 500; // extra for fees
-    const fundingAmount = parseFloat((totalNeeded / 1e8 + 0.001).toFixed(8));
+    // Build + sign under spend lock
+    const totalNeeded = count * satsEach + 500;
 
-    const fundingUtxos = await bulkFundWalletP2PK(this.dispatchWallet, 1, totalNeeded + 1000);
-    if (fundingUtxos.length === 0) throw new Error('No funding for fee UTXOs');
-
-    const feeTx = new Transaction();
-    feeTx.version = 2;
-    feeTx.addInput({
-      sourceTransaction: fundingUtxos[0].sourceTransaction,
-      sourceOutputIndex: fundingUtxos[0].vout,
-      unlockingScriptTemplate: this.dispatchWallet.p2pkUnlock(
-        fundingUtxos[0].satoshis, Script.fromHex(fundingUtxos[0].script),
-      ),
-    });
-
-    // Agent fee UTXOs as P2PK
     const agentPubkeyBytes = Buffer.from(agentPubkey, 'hex');
     const agentLockScript = new Script([
       { op: agentPubkeyBytes.length, data: [...agentPubkeyBytes] },
@@ -744,15 +906,25 @@ export class DispatchManager {
     ]).toHex();
     const agentLock = Script.fromHex(agentLockScript);
 
-    for (let i = 0; i < count; i++) {
-      feeTx.addOutput({ lockingScript: agentLock, satoshis: satsEach });
-    }
-    // Change back to dispatch
-    feeTx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
-    await feeTx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-    await feeTx.sign();
-
-    const feeTxid = await this.network.broadcast(feeTx);
+    // Parallel-safe: pick+sign under lock, broadcast outside
+    const { tx: feeTx, txid: feeTxid } = await this.walletTxWithRollback(async (picked) => {
+      const tx = new Transaction();
+      tx.version = 2;
+      for (let i = 0; i < picked.utxos.length; i++) {
+        tx.addInput({
+          sourceTransaction: picked.utxos[i].sourceTransaction,
+          sourceOutputIndex: picked.utxos[i].vout,
+          unlockingScriptTemplate: picked.unlockTemplates[i],
+        });
+      }
+      for (let i = 0; i < count; i++) {
+        tx.addOutput({ lockingScript: agentLock, satoshis: satsEach });
+      }
+      tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
+      await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
+      await tx.sign();
+      return { tx, walletOuts: [count], result: null };
+    }, totalNeeded);
     await this.network.mine(1);
 
     const result: FeePackage['utxos'] = [];
@@ -793,24 +965,23 @@ export class DispatchManager {
     agentLockScript = new P2PKH().lock(destination);
     console.log(`[dispatch] Paying ${agent.name} ${rewardSats} sats → ${destination}`);
 
-    const fundingUtxos = await bulkFundWalletP2PK(this.dispatchWallet, 1, rewardSats + 500);
-    if (fundingUtxos.length === 0) throw new Error('No funding for reward');
-
-    const rewardTx = new Transaction();
-    rewardTx.version = 2;
-    rewardTx.addInput({
-      sourceTransaction: fundingUtxos[0].sourceTransaction,
-      sourceOutputIndex: fundingUtxos[0].vout,
-      unlockingScriptTemplate: this.dispatchWallet.p2pkUnlock(
-        fundingUtxos[0].satoshis, Script.fromHex(fundingUtxos[0].script),
-      ),
-    });
-    rewardTx.addOutput({ lockingScript: agentLockScript, satoshis: rewardSats });
-    rewardTx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
-    await rewardTx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-    await rewardTx.sign();
-
-    const txid = await this.network.broadcast(rewardTx);
+    // Parallel-safe: pick+sign under lock, broadcast outside
+    const { txid } = await this.walletTxWithRollback(async (picked) => {
+      const tx = new Transaction();
+      tx.version = 2;
+      for (let i = 0; i < picked.utxos.length; i++) {
+        tx.addInput({
+          sourceTransaction: picked.utxos[i].sourceTransaction,
+          sourceOutputIndex: picked.utxos[i].vout,
+          unlockingScriptTemplate: picked.unlockTemplates[i],
+        });
+      }
+      tx.addOutput({ lockingScript: agentLockScript, satoshis: rewardSats });
+      tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
+      await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
+      await tx.sign();
+      return { tx, walletOuts: [1], result: null };
+    }, rewardSats + 200);
     await this.network.mine(1);
     agent.totalRewardsSats += rewardSats;
     const dest = destination || `P2PK(${agent.pubkey.slice(0, 8)}...)`;
@@ -1004,6 +1175,8 @@ export class DispatchManager {
           totalTxs: w.numSteps + 1,
           receptorName: w.receptor.name ?? '',
           chainSteps: w.numSteps,
+          genesisTxid: w.genesisTxid,
+          chainTxids: w.chainTxids,
         });
       }
     }

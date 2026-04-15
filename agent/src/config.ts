@@ -39,7 +39,7 @@ export const config = {
 
   // TX parameters
   dustLimit: 1,
-  feePerKb: parseInt(process.env.FEE_RATE_SATS_PER_KB || '100', 10),  // sats/kB — 100 is safe for ARC
+  feePerKb: parseInt(process.env.FEE_RATE_SATS_PER_KB || '100', 10),  // sats/kB — ARC enforces 100 sats/kB minimum
 
   // Agent parameters
   maxParallelChains: 10,

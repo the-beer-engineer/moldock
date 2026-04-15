@@ -126,7 +126,7 @@ export function dashboardHtml(): string {
 </style>
 </head>
 <body>
-<h1>MolDock Agent Swarm</h1>
+<h1>MolDock Agent Swarm <span id="server-version" style="font-size:11px;color:#555;font-weight:normal;margin-left:8px"></span></h1>
 <div class="subtitle">On-chain molecular docking via BSV covenant chains &mdash; <span id="target-drugs-sub">107</span> FDA-approved drugs vs <span id="target-receptors-sub">8</span> protein targets (CDK2, EGFR, HIV Protease, COVID Mpro, COX-2, ER-alpha, BRAF, AChE)</div>
 <div class="node-status" id="node-status">Node: checking...</div>
 
@@ -149,7 +149,7 @@ export function dashboardHtml(): string {
 <div class="agent-banner">
   <div class="banner-top">
     <div>
-      <h2>&#x1f9ec; Browser Compute Agent</h2>
+      <h2>&#x1f9ec; Browser Compute Agent<span id="ba-name-display" style="color:#88cc88;font-size:13px;margin-left:8px;font-weight:normal"></span></h2>
       <div class="banner-desc">Run a compute agent directly in your browser. Earn BSV by verifying molecular docking calculations on-chain.</div>
     </div>
     <button class="start-btn" id="start-btn" onclick="toggleBrowserAgent()">Start Computing</button>
@@ -242,6 +242,141 @@ export function dashboardHtml(): string {
     </table>
   </div>
 </div>
+
+<!-- Molecule detail modal -->
+<div id="mol-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);z-index:9999;overflow-y:auto">
+  <div style="max-width:700px;margin:40px auto;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:8px;padding:24px;color:#e0e0e0;font-family:monospace">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h2 style="margin:0;color:#00ff88" id="modal-title">Molecule</h2>
+      <button onclick="document.getElementById('mol-modal').style.display='none'" style="background:none;border:1px solid #333;color:#aaa;padding:4px 12px;cursor:pointer;border-radius:4px">&times; Close</button>
+    </div>
+    <div id="modal-body" style="font-size:13px;line-height:1.8"></div>
+  </div>
+</div>
+
+<script>
+function showMolModal(jsonStrOrEl) {
+  var r = typeof jsonStrOrEl === 'string' ? JSON.parse(jsonStrOrEl) : jsonStrOrEl;
+  var woc = 'https://whatsonchain.com/tx/';
+  document.getElementById('modal-title').textContent = r.moleculeId || 'Unknown';
+  var html = '';
+  html += '<div style="margin-bottom:12px">';
+  html += '<b>Target:</b> ' + (r.receptorName || 'unknown') + '<br>';
+  html += '<b>Score:</b> <span style="color:' + (r.passed ? '#00ff88' : '#ff6644') + '">' + r.finalScore + '</span> (' + (r.passed ? 'PASS' : 'FAIL') + ')<br>';
+  html += '<b>Agent:</b> ' + (r.agentName || 'unknown') + '<br>';
+  html += '<b>Chain steps:</b> ' + r.chainSteps + '<br>';
+  html += '<b>Total TXs:</b> ' + r.totalTxs + '<br>';
+  html += '</div>';
+  if (r.genesisTxid) {
+    html += '<div style="margin-bottom:8px"><b>Genesis TX:</b><br>';
+    html += '<a href="' + woc + r.genesisTxid + '" target="_blank" style="color:#4488ff;word-break:break-all">' + r.genesisTxid + '</a></div>';
+  }
+  if (r.chainTxids && r.chainTxids.length > 0) {
+    html += '<div><b>Chain TXs (' + r.chainTxids.length + '):</b><br>';
+    for (var i = 0; i < r.chainTxids.length; i++) {
+      html += '<span style="color:#888">Step ' + (i+1) + ':</span> <a href="' + woc + r.chainTxids[i] + '" target="_blank" style="color:#4488ff;word-break:break-all;font-size:11px">' + r.chainTxids[i] + '</a><br>';
+    }
+    html += '</div>';
+  } else if (r.passed) {
+    html += '<div style="color:#888">Chain TXs: broadcast by agent (pending confirmation)</div>';
+  }
+  document.getElementById('modal-body').innerHTML = html;
+  document.getElementById('mol-modal').style.display = 'block';
+}
+
+// --- Auto-restart watchdog ---
+// Saves agent name/address in localStorage on Start.
+// On page load, if a saved name exists, auto-clicks Start after the page is ready.
+// Polls /api/version every 10s; reloads the page when the server restarts (new version).
+(function() {
+  const VERSION_KEY = 'moldock_server_version';
+  const RUNNING_KEY = 'moldock_agent_running';
+  let lastSeenVersion = null;
+  let pollAttempts = 0;
+
+  // Auto-restart on page load if agent was running
+  function tryAutoStart() {
+    const saved = localStorage.getItem(RUNNING_KEY);
+    if (!saved) return;
+    try {
+      const { name, address } = JSON.parse(saved);
+      const nameInput = document.getElementById('ba-name');
+      const addrInput = document.getElementById('ba-paymail');
+      const startBtn = document.getElementById('start-btn');
+      if (nameInput && addrInput && startBtn && name) {
+        nameInput.value = name;
+        if (address) addrInput.value = address;
+        // Wait briefly for BSV SDK to load, then click Start
+        setTimeout(() => {
+          if (typeof window.toggleBrowserAgent === 'function') {
+            window.toggleBrowserAgent();
+          } else {
+            // SDK not loaded yet — try again
+            setTimeout(tryAutoStart, 1000);
+          }
+        }, 1500);
+      }
+    } catch {}
+  }
+
+  // Save state when the start button is clicked (intercept)
+  function patchStartButton() {
+    const original = window.toggleBrowserAgent;
+    if (!original) return setTimeout(patchStartButton, 200);
+    window.toggleBrowserAgent = function(...args) {
+      const wasRunning = window.browserAgentRunning;
+      const result = original.apply(this, args);
+      // Schedule a check after the toggle
+      setTimeout(() => {
+        if (window.browserAgentRunning) {
+          const name = (document.getElementById('ba-name')?.value || '').trim();
+          const address = (document.getElementById('ba-paymail')?.value || '').trim();
+          if (name) localStorage.setItem(RUNNING_KEY, JSON.stringify({ name, address }));
+        } else {
+          localStorage.removeItem(RUNNING_KEY);
+        }
+      }, 100);
+      return result;
+    };
+  }
+
+  // Version watchdog
+  async function checkVersion() {
+    try {
+      const r = await fetch('/api/version', { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (lastSeenVersion === null) {
+        lastSeenVersion = d.version;
+        localStorage.setItem(VERSION_KEY, d.version);
+        // Show version in header (formatted as a date)
+        const versionEl = document.getElementById('server-version');
+        if (versionEl) {
+          const dt = new Date(parseInt(d.version, 10));
+          const formatted = dt.toISOString().slice(0, 19).replace('T', ' ');
+          versionEl.textContent = 'v' + formatted + ' UTC';
+        }
+      } else if (d.version !== lastSeenVersion) {
+        console.log('[watchdog] Server version changed — reloading');
+        localStorage.setItem(VERSION_KEY, d.version);
+        // Hard reload to bypass cache
+        location.reload();
+      }
+      pollAttempts = 0;
+    } catch {
+      pollAttempts++;
+      // If server is down for a long time, don't reload yet — wait for it to come back
+    }
+  }
+
+  window.addEventListener('load', () => {
+    patchStartButton();
+    tryAutoStart();
+    checkVersion();
+    setInterval(checkVersion, 10000);
+  });
+})();
+</script>
 
 <script type="module">
 // Load @bsv/sdk from ESM CDN for in-browser chain building & signing.
@@ -479,7 +614,8 @@ async function refresh(){
       const cls=r.passed?'score good':'score bad';
       const res=r.passed?'<span class="pass">PASS</span>':'<span class="fail">FAIL</span>';
       const tgt=(r.receptorName||'').replace(/\s*\(PDB.*\)/,'').slice(0,20);
-      return '<tr><td class="rank">#'+(i+1)+'</td><td>'+r.moleculeId+'</td><td style="color:#00ccff;font-size:9px">'+tgt+'</td><td class="'+cls+'">'+r.finalScore+'</td><td>'+res+'</td><td style="color:#888">'+(r.agentName||'')+'</td><td>'+r.chainSteps+' steps</td></tr>';
+      const dataAttr=JSON.stringify(r).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
+      return '<tr style="cursor:pointer" onclick="showMolModal(this.dataset.mol)" data-mol="'+dataAttr+'"><td class="rank">#'+(i+1)+'</td><td>'+r.moleculeId+'</td><td style="color:#00ccff;font-size:9px">'+tgt+'</td><td class="'+cls+'">'+r.finalScore+'</td><td>'+res+'</td><td style="color:#888">'+(r.agentName||'')+'</td><td>'+r.chainSteps+' steps</td></tr>';
     }).join('');
 
   }catch(e){console.error('refresh',e)}
@@ -489,6 +625,7 @@ refresh();
 
 // Expose entry points for inline onclick handlers (module scope doesn't leak to window automatically).
 window.toggleBrowserAgent = (...args) => toggleBrowserAgent(...args);
+Object.defineProperty(window, 'browserAgentRunning', { get: () => browserAgentRunning });
 
 // ========== Browser Compute Agent ==========
 // Runs entirely client-side: fetches work from dispatch, computes energy,
@@ -534,6 +671,8 @@ async function toggleBrowserAgent() {
     $('start-btn').className = 'start-btn';
     $('agent-inputs').style.display = 'flex';
     $('ba-status').textContent = 'stopped';
+    const nameDisplayStop = document.getElementById('ba-name-display');
+    if (nameDisplayStop) nameDisplayStop.textContent = '';
     baLog('Agent stopped.', '#ff6644');
     return;
   }
@@ -577,6 +716,9 @@ async function toggleBrowserAgent() {
   $('browser-stats').style.display = 'flex';
   $('browser-log').style.display = 'block';
   $('ba-status').textContent = 'starting...';
+  // Show agent name in the header
+  const nameDisplay = document.getElementById('ba-name-display');
+  if (nameDisplay) nameDisplay.textContent = '— ' + agentName;
 
   // Generate session keypair
   browserPrivKey = BSV.PrivateKey.fromRandom();
@@ -588,16 +730,14 @@ async function toggleBrowserAgent() {
     const disc = await fetch('/api/discover').then(r => r.json());
     browserNetwork = disc.network || 'regtest';
     baLog('Discovered dispatch on ' + browserNetwork, '#88cc88');
-    if (browserNetwork !== 'regtest' && BSV.ARC) {
-      // ARC-lock: on testnet/mainnet broadcast direct to ARC, bypass dispatch forwarder.
-      const arcUrl = 'https://arc.gorillapool.io';
-      try {
-        browserArc = new BSV.ARC(arcUrl);
-        baLog('ARC direct broadcast enabled: ' + arcUrl, '#00ff88');
-      } catch (e) {
-        baLog('ARC init failed, falling back to dispatch forwarder: ' + e.message, '#ffaa00');
-        browserArc = null;
-      }
+    if (browserNetwork !== 'regtest') {
+      // Arcade broadcast: use Extended Format (EF) directly to Arcade.
+      // GorillaPool ARC accepts raw but never relays to miners.
+      const arcadeUrl = browserNetwork === 'mainnet'
+        ? 'https://arcade-us-1.bsvb.tech'
+        : 'https://arcade-testnet-us-1.bsvb.tech';
+      browserArc = { URL: arcadeUrl }; // flag for broadcastChainBrowser
+      baLog('Arcade broadcast enabled: ' + arcadeUrl, '#00ff88');
     }
   } catch (e) {
     baLog('Discover failed: ' + e.message, '#ff6644');
@@ -646,19 +786,24 @@ async function prepareNextWork(seed) {
   }
   const computeMs = (performance.now() - tCompute).toFixed(0);
   const passed = baIsPassing(totalScore);
+  // Build chain — failures here should not kill the agent loop
   let chain = null;
   let buildMs = '0';
-  if (passed) {
+  try {
     const tBuild = performance.now();
     chain = buildChainBrowser(work, stepBatches);
     buildMs = (performance.now() - tBuild).toFixed(0);
+  } catch (e) {
+    console.error('buildChainBrowser failed:', e);
+    // Return without chain — will be handled as a fail
   }
-  return { work, stepBatches, totalScore, passed, chain, computeMs, buildMs };
+  return { work, stepBatches, totalScore, passed: chain ? passed : false, chain, computeMs, buildMs };
 }
 
 // Broadcast step TXs honoring the backoff clock + ARC lock.
 // When browserArc is set (testnet/mainnet) goes direct-to-ARC; otherwise uses dispatch forwarder.
-async function broadcastChainBrowser(stepTxHexes) {
+// stepTxs: array of Transaction objects (from rebuildChainWithFees) or raw hex strings (fallback)
+async function broadcastChainBrowser(stepTxs) {
   // Respect backoff from previous "too-long-mempool-chain" style errors.
   const wait = baBackoffUntil - Date.now();
   if (wait > 0) {
@@ -666,22 +811,41 @@ async function broadcastChainBrowser(stepTxHexes) {
     await new Promise(r => setTimeout(r, wait));
   }
 
-  if (browserArc) {
-    // ARC-direct path: broadcast each step TX via BSV.ARC instance.
-    for (let i = 0; i < stepTxHexes.length; i++) {
-      try {
-        const tx = BSV.Transaction.fromHex(stepTxHexes[i]);
-        const res = await browserArc.broadcast(tx);
-        if (res && res.status && res.status >= 400) {
-          return { ok: false, error: 'arc step ' + i + ': ' + (res.description || res.status) };
+  if (browserArc && stepTxs.length > 0 && typeof stepTxs[0] !== 'string') {
+    // Arcade broadcast with Extended Format (EF) — only when we have Transaction objects
+    // with sourceTransaction references (from rebuildChainWithFees).
+    // Sequential: each chain step spends the previous step's output.
+    const arcadeUrl = browserArc.URL;
+    for (let i = 0; i < stepTxs.length; i++) {
+      const efHex = stepTxs[i].toHexEF();
+      const body = Uint8Array.from(efHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+      let success = false;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        try {
+          const r = await fetch(arcadeUrl + '/tx', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: body,
+          });
+          if (r.ok) { success = true; break; }
+          const errText = await r.text();
+          // SQLITE_BUSY and other 5xx: retry with exponential backoff
+          if (r.status >= 500 && attempt < 7) {
+            const waitMs = 200 + Math.random() * 500 * Math.pow(2, attempt);
+            await new Promise(res => setTimeout(res, waitMs));
+            continue;
+          }
+          return { ok: false, error: 'arcade step ' + i + ': Arcade ' + r.status + ': ' + errText.slice(0, 200) };
+        } catch (e) {
+          // Network error — retry
+          if (attempt < 7) {
+            await new Promise(res => setTimeout(res, 500 * (attempt + 1)));
+            continue;
+          }
+          return { ok: false, error: 'arcade step ' + i + ' network: ' + String(e.message || e) };
         }
-      } catch (e) {
-        const msg = String(e && e.message || e);
-        if (/too.long.mempool.chain|mempool.full|chain.too.long|limit.?ancestor|limit.?descendant/i.test(msg)) {
-          baBackoffUntil = Date.now() + 3500;
-        }
-        return { ok: false, error: 'arc step ' + i + ': ' + msg };
       }
+      if (!success) return { ok: false, error: 'arcade step ' + i + ' retries exhausted' };
     }
     return { ok: true };
   }
@@ -690,7 +854,7 @@ async function broadcastChainBrowser(stepTxHexes) {
   const bcastRes = await fetch('/api/broadcast', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ txHexes: stepTxHexes }),
+    body: JSON.stringify({ txHexes: stepTxs.map(t => typeof t === 'string' ? t : t.toHex()) }),
   }).then(r => r.json());
   if (!bcastRes.ok && bcastRes.backoff) {
     baBackoffUntil = Date.now() + 3500;
@@ -703,9 +867,10 @@ async function browserWorkLoop() {
   let nextPrepPromise = prepareNextWork(null);
 
   while (browserAgentRunning) {
+    let prep = null;
     try {
       $('ba-status').textContent = 'waiting for prep...';
-      const prep = await nextPrepPromise;
+      prep = await nextPrepPromise;
       nextPrepPromise = null;
 
       if (!prep) {
@@ -721,7 +886,7 @@ async function browserWorkLoop() {
 
       baStats.molecules++;
 
-      if (!passed) {
+      if (!passed || !chain) {
         baStats.failed++;
         baLog('FAIL ' + molId + ' score=' + totalScore + ' (' + computeMs + 'ms)', '#ff6644');
         const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
@@ -739,45 +904,77 @@ async function browserWorkLoop() {
       $('ba-status').textContent = 'requesting fees...';
       const t2 = performance.now();
 
-      // Step 1: Submit pass WITHOUT alreadyBroadcast to get fee UTXOs
-      const passRes = await fetch('/api/agent/' + browserAgentId + '/pass', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          workId: work.id,
-          finalScore: totalScore,
-          chainTxHexes: chain.txHexes,
-          alreadyBroadcast: false,
-        }),
-      }).then(r => r.json());
+      // Step 1: Submit pass and request fee UTXOs — with timeout + retry
+      let passRes = null;
+      for (let passAttempt = 0; passAttempt < 3; passAttempt++) {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 30000); // 30s timeout
+          const r = await fetch('/api/agent/' + browserAgentId + '/pass', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              workId: work.id,
+              finalScore: totalScore,
+              chainTxHexes: chain.txHexes,
+              alreadyBroadcast: false,
+            }),
+            signal: ctrl.signal,
+          });
+          clearTimeout(timer);
+          passRes = await r.json();
+          if (passRes.ok) break;
+          // Server returned error — retry once more if it looks transient
+          if (passAttempt < 2 && /No funding|Arcade 5|broadcast failed/i.test(passRes.error || '')) {
+            baLog('Fees retry ' + (passAttempt+1) + ': ' + (passRes.error || '?'), '#ffaa00');
+            await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+            continue;
+          }
+          break;
+        } catch (e) {
+          if (passAttempt < 2) {
+            baLog('Fees timeout, retrying...', '#ffaa00');
+            await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+            continue;
+          }
+          passRes = { ok: false, error: 'timeout: ' + (e.message || e) };
+        }
+      }
 
-      if (!passRes.ok) {
-        baLog('Pass rejected: ' + (passRes.error || 'unknown'), '#ff4444');
-        nextPrepPromise = prepareNextWork(null);
+      if (!passRes || !passRes.ok) {
+        baLog('Pass rejected: ' + (passRes?.error || 'unknown'), '#ff4444');
+        // Submit fail to clear the work assignment so we can move on
+        try {
+          const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ workId: work.id, finalScore: 999999 }),
+          }).then(r => r.json());
+          nextPrepPromise = prepareNextWork(failRes.nextWork || null);
+        } catch {
+          nextPrepPromise = prepareNextWork(null);
+        }
         baUpdateStats();
         continue;
       }
 
       // Step 2: Rebuild chain step TXs with fee inputs
       const feePackage = passRes.feePackage;
-      const stepTxHexes = chain.txHexes.slice(1); // skip genesis (already broadcast by dispatch)
-      let rebuiltStepHexes = stepTxHexes;
+      let rebuiltTxObjects = null; // Transaction objects with sourceTransaction for EF
 
       if (feePackage && feePackage.utxos && feePackage.utxos.length > 0) {
         $('ba-status').textContent = 'adding fees...';
         try {
-          rebuiltStepHexes = await rebuildChainWithFees(chain, feePackage.utxos);
+          rebuiltTxObjects = await rebuildChainWithFees(chain, feePackage.utxos);
         } catch (rebuildErr) {
           baLog('Fee rebuild failed: ' + rebuildErr.message + ' — broadcasting without fees', '#ffaa00');
         }
       }
 
       // Step 3: Broadcast rebuilt chain with fees
-      // Start next prep in parallel with broadcast.
-      nextPrepPromise = prepareNextWork(null);
       $('ba-status').textContent = 'broadcasting...';
 
-      const bcastRes = await broadcastChainBrowser(rebuiltStepHexes);
+      const bcastRes = await broadcastChainBrowser(rebuiltTxObjects || chain.txHexes.slice(1));
       const bcastMs = (performance.now() - t2).toFixed(0);
 
       if (!bcastRes.ok) {
@@ -785,16 +982,13 @@ async function browserWorkLoop() {
           ? 'step ' + bcastRes.errors[0].index + ': ' + bcastRes.errors[0].error
           : (bcastRes.error || 'unknown');
         baLog('Broadcast failed: ' + errMsg, '#ff4444');
-        // Report broadcast failure
         const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ workId: work.id, finalScore: totalScore }),
         }).then(r => r.json());
         if (failRes.reward) baStats.earned += failRes.reward;
-        if (failRes.nextWork) {
-          nextPrepPromise = prepareNextWork(failRes.nextWork);
-        }
+        nextPrepPromise = prepareNextWork(failRes.nextWork || null);
         baUpdateStats();
         continue;
       }
@@ -804,20 +998,43 @@ async function browserWorkLoop() {
       baStats.earned += (passRes.reward || 100);
       baLog('PASS ' + molId + ' score=' + totalScore + ' compute=' + computeMs + 'ms build=' + buildMs + 'ms bcast=' + bcastMs + 'ms ' + chain.txHexes.length + ' TXs', '#00ff88');
 
-      // Confirm broadcast txids for trust accounting
-      fetch('/api/agent/' + browserAgentId + '/confirm', {
+      // Compute correct TXIDs from the broadcast chain TXs
+      const broadcastSrc = rebuiltTxObjects || chain.txHexes.slice(1);
+      const broadcastTxids = broadcastSrc.map(function(txOrHex) {
+        if (typeof txOrHex === 'string') return BSV.Transaction.fromHex(txOrHex).id('hex');
+        return txOrHex.id('hex');
+      });
+
+      // Confirm broadcast — wait for response to get next work assignment
+      const confirmRes = await fetch('/api/agent/' + browserAgentId + '/confirm', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ workId: work.id, txids: chain.stepTxids }),
-      }).catch(() => {});
+        body: JSON.stringify({ workId: work.id, txids: broadcastTxids }),
+      }).then(r => r.json()).catch(() => ({}));
+      nextPrepPromise = prepareNextWork(confirmRes.nextWork || null);
 
       baUpdateStats();
       $('ba-status').textContent = 'idle';
 
     } catch (err) {
       baLog('Error: ' + err.message, '#ff4444');
-      await new Promise(r => setTimeout(r, 3000));
-      if (!nextPrepPromise) nextPrepPromise = prepareNextWork(null);
+      // Submit fail to clear the assigned work so we can get new work
+      if (prep && prep.work) {
+        try {
+          const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ workId: prep.work.id, finalScore: 999999 }),
+          }).then(r => r.json());
+          nextPrepPromise = prepareNextWork(failRes.nextWork || null);
+        } catch (e2) {
+          await new Promise(r => setTimeout(r, 3000));
+          nextPrepPromise = prepareNextWork(null);
+        }
+      } else {
+        await new Promise(r => setTimeout(r, 3000));
+        if (!nextPrepPromise) nextPrepPromise = prepareNextWork(null);
+      }
     }
   }
 }
@@ -996,12 +1213,12 @@ async function rebuildChainWithFees(chain, feeUtxos) {
     // Sign fee input (input 1 only — input 0 uses data-push scriptSig)
     await newTx.sign();
 
-    rebuilt.push(newTx.toHex());
+    rebuilt.push(newTx);
     prevTx = newTx;
     prevTxid = newTx.id('hex');
   }
 
-  return rebuilt;
+  return rebuilt; // returns Transaction objects (with sourceTransaction intact for EF)
 }
 
 function buildChainBrowser(work, stepBatches) {

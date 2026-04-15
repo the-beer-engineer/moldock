@@ -48,13 +48,14 @@ export interface NetworkAdapter {
 // ---------------------------------------------------------------------------
 // ARC endpoints
 // ---------------------------------------------------------------------------
+// Arcade endpoints — requires Extended Format (EF) for broadcast.
+// GorillaPool ARC accepts raw but never relays to miners; Arcade with EF works.
 const ARC_ENDPOINTS: Record<'testnet' | 'mainnet', string[]> = {
   testnet: [
-    'https://arc.gorillapool.io',
     'https://arcade-testnet-us-1.bsvb.tech',
+    'https://arcade-ttn-us-1.bsvb.tech',
   ],
   mainnet: [
-    'https://arc.gorillapool.io',
     'https://arcade-us-1.bsvb.tech',
   ],
 };
@@ -150,17 +151,24 @@ export class ArcAdapter implements NetworkAdapter {
   getNetwork(): NetworkType { return this.networkType; }
 
   async broadcast(tx: Transaction): Promise<string> {
-    const rawHex = tx.toHex();
-    const body = Buffer.from(rawHex, 'hex');
+    // Arcade requires Extended Format (EF) — includes source TX data inline.
+    const efHex = tx.toHexEF();
+    const body = Buffer.from(efHex, 'hex');
+    const TIMEOUT_MS = 15000; // 15s per attempt
+    const MAX_ATTEMPTS = 8;   // aggressive retry on 5xx (SQLITE_BUSY etc.)
 
-    for (let attempt = 1; attempt <= this.retries; attempt++) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       for (const endpoint of this.endpoints) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
         try {
-          const response = await fetch(`${endpoint}/v1/tx`, {
+          const response = await fetch(`${endpoint}/tx`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
             body,
+            signal: controller.signal,
           });
+          clearTimeout(timer);
 
           if (response.ok) {
             const data = await response.json() as any;
@@ -169,21 +177,32 @@ export class ArcAdapter implements NetworkAdapter {
 
           const errorText = await response.text();
 
-          // Don't retry on client errors (4xx) except 429 (rate limit)
+          // 4xx client errors (except 429) — don't retry, throw immediately
           if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-            throw new Error(`ARC ${response.status}: ${errorText}`);
+            throw new Error(`Arcade ${response.status}: ${errorText}`);
           }
+
+          // 5xx / 429 — retry with backoff
+          if (attempt < MAX_ATTEMPTS) {
+            const waitMs = 200 + Math.random() * 500 * Math.pow(2, attempt - 1);
+            await sleep(Math.min(waitMs, 5000));
+            continue;
+          }
+          throw new Error(`Arcade ${response.status}: ${errorText}`);
         } catch (err: any) {
-          if (err.message?.startsWith('ARC 4')) throw err; // don't retry client errors
-          if (attempt === this.retries) {
-            throw new Error(`ARC broadcast failed after ${this.retries} attempts: ${err.message}`);
+          clearTimeout(timer);
+          if (err.message?.startsWith('Arcade 4')) throw err;
+          if (attempt === MAX_ATTEMPTS) {
+            throw new Error(`Arcade broadcast failed after ${MAX_ATTEMPTS} attempts: ${err.message}`);
           }
+          // Network error / timeout — retry
+          const waitMs = 200 + Math.random() * 500 * Math.pow(2, attempt - 1);
+          await sleep(Math.min(waitMs, 5000));
         }
       }
-      await sleep(this.retryDelayMs * attempt);
     }
 
-    throw new Error('ARC broadcast: max retries exceeded');
+    throw new Error('Arcade broadcast: max retries exceeded');
   }
 
   async broadcastHex(hex: string): Promise<string> {

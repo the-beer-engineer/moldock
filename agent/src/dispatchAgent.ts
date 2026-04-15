@@ -19,7 +19,7 @@ import { randomUUID } from 'crypto';
 import { Transaction, Script, SatoshisPerKilobyte } from '@bsv/sdk';
 import { Wallet } from './wallet.js';
 import { DispatchManager } from './dispatch.js';
-import { getCompiledAsm, bulkFundWalletP2PK } from './chainBuilder.js';
+import { getCompiledAsm } from './chainBuilder.js';
 import { buildChainLockScript, createGenesisTx } from './genesis.js';
 import { getRealMolecules } from './generate.js';
 import { dashboardHtml } from './dashboard.js';
@@ -29,6 +29,9 @@ import type { Molecule, ReceptorSite } from './types.js';
 import { getNetwork } from './network.js';
 
 const network = getNetwork();
+
+// Server version = process start time. Browsers poll /api/version and reload on change.
+const SERVER_VERSION = Date.now().toString();
 
 // --- Configuration ---
 const PORT = parseInt(process.env.PORT ?? '3456');
@@ -54,6 +57,8 @@ async function initDispatch(): Promise<void> {
   dispatch = new DispatchManager(wallet);
   // Check for new deposits (UTXOs are restored from state file in constructor)
   await dispatch.scanForDeposits();
+  // Fan out any large UTXOs so parallel agents don't contend
+  await dispatch.fanOutIfNeeded(500000, 50, 300000);
   dispatchReady = true;
   console.log(`[init] Dispatch ready — accepting compute agents on http://localhost:${PORT}`);
 }
@@ -109,74 +114,13 @@ async function autoQueueLoop(): Promise<void> {
 
 async function postBountyBatch(count: number): Promise<void> {
   if (!dispatch) throw new Error('Dispatch not ready');
-
-  const real = getRealMolecules(count);
-  const molecules = real.molecules;
-  const receptors = real.receptors;
-  const defaultReceptor = real.receptor;
-
-  // Pre-compile ASM for all ligand atom counts (script is parameterized by ligand atoms, not receptor)
-  const atomCounts = [...new Set(molecules.map(m => m.atoms.length))];
-  const asmMap = new Map<number, string>();
-  for (const ac of atomCounts) {
-    asmMap.set(ac, getCompiledAsm(ac));
-  }
-
-  // Bulk fund genesis TXs
-  const fundingUtxos = await bulkFundWalletP2PK(wallet, count, 10000);
-
-  // Create genesis TXs
-  const workItems: Array<{
-    molecule: Molecule; receptor: ReceptorSite; compiledAsm: string;
-    genesisTxHex: string; genesisTxid: string;
-  }> = [];
-
-  let txsSinceLastMine = 0;
-  for (let i = 0; i < count; i++) {
-    const mol = molecules[i];
-    const utxo = fundingUtxos[i];
-    const compiledAsm = asmMap.get(mol.atoms.length)!;
-
-    // Look up the correct receptor for this molecule
-    const molReceptor = ((mol as any).receptorId && receptors.get((mol as any).receptorId)) || defaultReceptor;
-
-    const genesisTx = new Transaction();
-    genesisTx.version = 2;
-    genesisTx.addInput({
-      sourceTransaction: utxo.sourceTransaction,
-      sourceOutputIndex: utxo.vout,
-      unlockingScriptTemplate: wallet.p2pkUnlock(utxo.satoshis, Script.fromHex(utxo.script)),
-    });
-    genesisTx.addOutput({ lockingScript: buildChainLockScript(mol.atoms.length, 0, compiledAsm), satoshis: 1 });
-    genesisTx.addOutput({ lockingScript: wallet.p2pkLockingScript(), change: true });
-    await genesisTx.fee(new SatoshisPerKilobyte(config.feePerKb));
-    await genesisTx.sign();
-
-    const genesisTxid = await network.broadcast(genesisTx);
-    txsSinceLastMine++;
-
-    workItems.push({
-      molecule: mol,
-      receptor: molReceptor,
-      compiledAsm,
-      genesisTxHex: genesisTx.toHex(),
-      genesisTxid,
-    });
-
-    if (txsSinceLastMine >= 20) {
-      await network.mine(1);
-      txsSinceLastMine = 0;
-    }
-  }
-  if (txsSinceLastMine > 0) await network.mine(1);
-
-  // Enqueue into dispatch
-  const batchId = randomUUID().slice(0, 8);
+  // Genesis TXs are now created on-demand by DispatchManager.createWorkPackage()
+  // when an agent requests work. This avoids the bulkFundWalletP2PK intermediate
+  // fan-out TX that caused mempool chain depth issues on mainnet.
+  // Just ensure the auto-queue loop stays alive — molecules are loaded in the constructor.
   dispatch.startTime = dispatch.startTime || performance.now();
-  dispatch.enqueueExternalWork(workItems, batchId);
-
   totalBountiesPosted += count;
-  console.log(`[auto] Posted ${count} bounties (batch ${batchId}, total: ${totalBountiesPosted})`);
+  console.log(`[auto] Auto-queue cycle (molecules ready in dispatch queue)`);
 }
 
 // --- HTTP Server ---
@@ -416,7 +360,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (method === 'GET' && url.pathname === '/api/discover') {
     json(res, {
       service: 'moldock-dispatch',
-      version: '1.0.0',
+      version: SERVER_VERSION,
       network: config.network,
       dispatchPubkey: wallet.publicKeyHex,
       dispatchAddress: wallet.address,
@@ -431,7 +375,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // --- Version endpoint (browser polls this; reloads on change) ---
+  if (method === 'GET' && url.pathname === '/api/version') {
+    json(res, { version: SERVER_VERSION });
+    return;
+  }
+
   // --- Scan for new funding UTXOs ---
+  // Fix startTime if it's 0 but agents have done work
+  if (method === 'POST' && url.pathname === '/api/fix-timer') {
+    if (dispatch && dispatch.startTime === 0) {
+      dispatch.startTime = performance.now() - 1000; // pretend we started 1s ago to avoid div-by-zero
+      json(res, { ok: true, message: 'Timer started' });
+    } else {
+      json(res, { ok: true, message: 'Timer already running' });
+    }
+    return;
+  }
+
   if (method === 'POST' && url.pathname === '/api/scan-funding') {
     try {
       // Scan for new P2PKH deposits, then return balance from persisted UTXO set
