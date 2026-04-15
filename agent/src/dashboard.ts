@@ -898,7 +898,10 @@ async function broadcastChainBrowser(stepTxs) {
 
     async function sendOne(efHex, idx) {
       const body = Uint8Array.from(efHex.match(/.{2}/g).map(b => parseInt(b, 16)));
-      for (let attempt = 0; attempt < 6; attempt++) {
+      // Up to 12 attempts for transient errors (SQLITE_BUSY). Capped wait 2s.
+      // Total budget: ~12 × ~1s = 12s per TX.
+      const MAX_ATTEMPTS = 12;
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         const url = ARCADE_ENDPOINTS[(endpointIdx + idx + attempt) % ARCADE_ENDPOINTS.length];
         try {
           const r = await fetch(url + '/tx', {
@@ -906,7 +909,6 @@ async function broadcastChainBrowser(stepTxs) {
             headers: { 'Content-Type': 'application/octet-stream' },
             body: body,
           });
-          // Parse body — Arcade returns HTTP 200 even on REJECTED status
           const respText = await r.text();
           let respJson = null;
           try { respJson = JSON.parse(respText); } catch {}
@@ -915,19 +917,20 @@ async function broadcastChainBrowser(stepTxs) {
           if (isOk) return null;
 
           const errMsg = respJson?.extraInfo || respJson?.detail || respJson?.error || respText.slice(0, 200);
-          // 5xx (SQLITE_BUSY) or "missing parent"/REJECTED — retry with backoff
+          // Retry on any transient: 5xx, REJECTED, network / DB contention
           const isRetryable = r.status >= 500
             || txStatus === 'REJECTED'
-            || /missing|unknown|previous|not found|sqlite|busy/i.test(errMsg);
-          if (isRetryable && attempt < 5) {
-            const waitMs = 200 + Math.random() * 400 * Math.pow(2, attempt);
+            || /missing|unknown|previous|not found|sqlite|busy|timeout|PROCESSING/i.test(errMsg);
+          if (isRetryable && attempt < MAX_ATTEMPTS - 1) {
+            // Linear backoff with jitter — exponential blew past the budget.
+            const waitMs = 400 + Math.random() * 800;
             await new Promise(res => setTimeout(res, waitMs));
             continue;
           }
           return { error: 'Arcade ' + r.status + '/' + (txStatus || 'err') + ': ' + errMsg.slice(0, 150) };
         } catch (e) {
-          if (attempt < 5) {
-            await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
+          if (attempt < MAX_ATTEMPTS - 1) {
+            await new Promise(res => setTimeout(res, 400 + Math.random() * 800));
             continue;
           }
           return { error: 'network: ' + String(e.message || e) };
