@@ -231,11 +231,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  // --- Agent Work ---
+  // --- Agent Work (single, legacy) ---
   const agentWorkMatch = url.pathname.match(/^\/api\/agent\/([^/]+)\/work$/);
   if (method === 'GET' && agentWorkMatch) {
     if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
     const agentId = agentWorkMatch[1];
+    const count = parseInt(url.searchParams.get('count') ?? '1', 10);
+    if (count > 1) {
+      const result = await dispatch.createWorkBatch(agentId, Math.min(count, 10));
+      if (result.error) { json(res, { error: result.error }, 400); return; }
+      json(res, { works: (result.works || []).map(serializeWork) });
+      return;
+    }
     const result = await dispatch.createWorkPackage(agentId);
     if (result.error) { json(res, { error: result.error }, 400); return; }
     json(res, { work: serializeWork(result.work!) });

@@ -764,14 +764,38 @@ async function toggleBrowserAgent() {
   }
 }
 
+// Local queue of pre-fetched work packages. Refilled in batches to amortize Cloudflare RTT.
+let workQueue = [];
+const WORK_BATCH_SIZE = 5;
+
+async function fetchWorkBatch() {
+  try {
+    const r = await fetch('/api/agent/' + browserAgentId + '/work?count=' + WORK_BATCH_SIZE);
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data.works && Array.isArray(data.works)) {
+      workQueue.push(...data.works);
+    } else if (data.work) {
+      workQueue.push(data.work);
+    }
+  } catch (e) {
+    console.warn('fetchWorkBatch failed:', e);
+  }
+}
+
 // Fetch + compute + build for one work item. Returns null if no work is available.
 // seed can be a pre-fetched work object (from a previous pass/fail response) to skip /work.
 async function prepareNextWork(seed) {
   let work = seed || null;
   if (!work) {
-    const workRes = await fetch('/api/agent/' + browserAgentId + '/work').then(r => r.json());
-    if (workRes.error || !workRes.work) return null;
-    work = workRes.work;
+    // Refill queue if empty
+    if (workQueue.length === 0) await fetchWorkBatch();
+    if (workQueue.length === 0) return null;
+    work = workQueue.shift();
+    // Pre-fetch next batch when queue is half empty (overlap with chain compute/broadcast)
+    if (workQueue.length <= 2) {
+      fetchWorkBatch().catch(() => {});
+    }
   }
   const tCompute = performance.now();
   const stepBatches = [];

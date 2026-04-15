@@ -603,10 +603,35 @@ export class DispatchManager {
     console.log(`[dispatch] Enqueued ${items.length} external work items (batch ${batchId})`);
   }
 
-  async createWorkPackage(agentId: string): Promise<{ work?: WorkPackage; error?: string }> {
+  /**
+   * Create N work packages for an agent in parallel.
+   * The wallet broadcasts run concurrently (via walletTxWithRollback's parallel pattern).
+   */
+  async createWorkBatch(agentId: string, count: number): Promise<{ works?: WorkPackage[]; error?: string }> {
     const agent = this.agents.get(agentId);
     if (!agent) return { error: 'Agent not found' };
-    if (agent.currentWorkId) return { error: 'Agent already has work assigned' };
+    if (this.startTime === 0) this.startTime = performance.now();
+
+    const promises: Promise<{ work?: WorkPackage; error?: string }>[] = [];
+    for (let i = 0; i < count; i++) {
+      promises.push(this.createWorkPackageInternal(agentId, true));
+    }
+    const results = await Promise.all(promises);
+    const works = results.filter(r => r.work).map(r => r.work!);
+    if (works.length === 0) {
+      return { error: results[0]?.error || 'No work created' };
+    }
+    return { works };
+  }
+
+  async createWorkPackage(agentId: string): Promise<{ work?: WorkPackage; error?: string }> {
+    return this.createWorkPackageInternal(agentId, false);
+  }
+
+  private async createWorkPackageInternal(agentId: string, allowConcurrent: boolean): Promise<{ work?: WorkPackage; error?: string }> {
+    const agent = this.agents.get(agentId);
+    if (!agent) return { error: 'Agent not found' };
+    if (!allowConcurrent && agent.currentWorkId) return { error: 'Agent already has work assigned' };
 
     // Start the clock on first work assignment
     if (this.startTime === 0) this.startTime = performance.now();
@@ -629,8 +654,10 @@ export class DispatchManager {
         batchId: ext.batchId,
       };
       this.work.set(workId, work);
-      agent.currentWorkId = workId;
-      agent.currentMoleculeId = ext.molecule.id;
+      if (!allowConcurrent) {
+        agent.currentWorkId = workId;
+        agent.currentMoleculeId = ext.molecule.id;
+      }
       agent.lastSeen = new Date().toISOString();
       this.pushEvent({ type: 'assigned', agentName: agent.name, agentId, moleculeId: ext.molecule.id });
       console.log(`[dispatch] Work ${workId} assigned to ${agent.name}: ${ext.molecule.id} (batch ${ext.batchId})`);
@@ -711,8 +738,12 @@ export class DispatchManager {
       };
 
       this.work.set(workId, work);
-      agent.currentWorkId = workId;
-      agent.currentMoleculeId = molecule.id;
+      // In batch mode (allowConcurrent), browser tracks its own queue.
+      // In single mode, we set currentWorkId to enforce one-at-a-time.
+      if (!allowConcurrent) {
+        agent.currentWorkId = workId;
+        agent.currentMoleculeId = molecule.id;
+      }
       agent.lastSeen = new Date().toISOString();
       this.pushEvent({ type: 'assigned', agentName: agent.name, agentId, moleculeId: molecule.id });
 
@@ -1113,7 +1144,7 @@ export class DispatchManager {
     const workItems = [...this.work.values()];
     return {
       totalAgents: agents.length,
-      activeAgents: agents.filter(a => a.currentWorkId).length,
+      activeAgents: agents.filter(a => a.currentWorkId || (Date.now() - new Date(a.lastSeen).getTime() < 60000)).length,
       totalWorkCreated: workItems.length,
       totalPassed: workItems.filter(w => w.status === 'pass' || w.status === 'verified').length,
       totalFailed: workItems.filter(w => w.status === 'fail').length,
@@ -1221,7 +1252,7 @@ export class DispatchManager {
 
     return {
       totalAgents: agents.length,
-      activeAgents: agents.filter(a => a.currentWorkId).length,
+      activeAgents: agents.filter(a => a.currentWorkId || (Date.now() - new Date(a.lastSeen).getTime() < 60000)).length,
       processed: totalProcessed,
       passed: totalPassed,
       failed: totalFailed,
