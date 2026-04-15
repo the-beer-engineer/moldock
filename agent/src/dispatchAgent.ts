@@ -170,8 +170,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   // --- Dashboard ---
   if (method === 'GET' && (url.pathname === '/' || url.pathname === '/dashboard')) {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(dashboardHtml());
+    const html = dashboardHtml();
+    const acceptEncoding = (req.headers['accept-encoding'] || '') as string;
+    const headers: Record<string, string> = {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'public, max-age=10', // short cache to ease repeated tab opens
+    };
+    if (acceptEncoding.includes('gzip')) {
+      const zlib = await import('zlib');
+      const gzipped = zlib.gzipSync(Buffer.from(html, 'utf-8'), { level: 6 });
+      headers['Content-Encoding'] = 'gzip';
+      headers['Content-Length'] = String(gzipped.length);
+      res.writeHead(200, headers);
+      res.end(gzipped);
+    } else {
+      headers['Content-Length'] = String(Buffer.byteLength(html, 'utf-8'));
+      res.writeHead(200, headers);
+      res.end(html);
+    }
     return;
   }
 

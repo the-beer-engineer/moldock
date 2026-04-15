@@ -273,8 +273,15 @@ export class DispatchManager {
    * Returns inputs ready to add to a Transaction.
    */
   private pickWalletUtxos(minSats: number): { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number } | null {
+    // Expire failed-UTXO blacklist entries older than 10 min
+    const now = Date.now();
+    const BLACKLIST_TTL = 10 * 60 * 1000;
+    for (const [k, t] of this._failedUtxos.entries()) {
+      if (now - t > BLACKLIST_TTL) this._failedUtxos.delete(k);
+    }
+    const blacklisted = this._failedUtxos;
     const available = this.dispatchWallet.getUtxos()
-      .filter(u => u.sourceTransaction)
+      .filter(u => u.sourceTransaction && !blacklisted.has(`${u.txid}:${u.vout}`))
       .sort((a, b) => a.satoshis - b.satoshis); // smallest first — avoid wasting big UTXOs
     if (available.length === 0) return null;
 
@@ -334,51 +341,76 @@ export class DispatchManager {
    * This allows N agents to have N broadcasts in flight simultaneously,
    * with only the ~10ms pick+sign step serialized.
    */
+  // UTXOs that have recently failed broadcast — skipped on subsequent picks.
+  // Cleared every 10 min so we eventually retry them.
+  private _failedUtxos = new Map<string, number>();
+
   private async walletTxWithRollback<T>(
     build: (picked: { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number }) => Promise<{ tx: Transaction; walletOuts: number[]; result: T }>,
     minSats: number,
   ): Promise<{ tx: Transaction; txid: string; result: T }> {
-    // Phase 1: pick + sign + mark spent (under lock)
-    const { tx, walletOuts, result, snapshots } = await this.withSpendLock(async () => {
-      const picked = this.pickWalletUtxos(minSats);
-      if (!picked) throw new Error(`No funding available (need ${minSats} sats, have ${this.dispatchWallet.balance})`);
-      const snapshots = picked.utxos.map(u => ({ ...u }));
-      const { tx, walletOuts, result } = await build(picked);
-      for (const u of picked.utxos) this.dispatchWallet.spendUtxo(u.txid, u.vout);
-      return { tx, walletOuts, result, snapshots };
-    });
+    const MAX_ATTEMPTS = 3;
+    let lastErr: any;
 
-    // Phase 2: broadcast (outside lock — parallel across agents)
-    let txid: string;
-    try {
-      txid = await this.network.broadcast(tx);
-    } catch (err) {
-      await this.withSpendLock(async () => {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      // Phase 1: pick + sign + mark spent (under lock)
+      let phase1: { tx: Transaction; walletOuts: number[]; result: T; snapshots: UTXO[] } | null = null;
+      try {
+        phase1 = await this.withSpendLock(async () => {
+          const picked = this.pickWalletUtxos(minSats);
+          if (!picked) throw new Error(`No funding available (need ${minSats} sats, have ${this.dispatchWallet.balance})`);
+          const snapshots = picked.utxos.map(u => ({ ...u }));
+          const { tx, walletOuts, result } = await build(picked);
+          for (const u of picked.utxos) this.dispatchWallet.spendUtxo(u.txid, u.vout);
+          return { tx, walletOuts, result, snapshots };
+        });
+      } catch (err) {
+        lastErr = err;
+        throw err; // pick errors aren't retryable
+      }
+
+      const { tx, walletOuts, result, snapshots } = phase1;
+
+      // Phase 2: broadcast (outside lock)
+      try {
+        const txid = await this.network.broadcast(tx);
+
+        // Phase 3: add output UTXOs back to wallet
+        if (walletOuts.length > 0) {
+          await this.withSpendLock(async () => {
+            const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
+            for (const idx of walletOuts) {
+              const out = tx.outputs[idx];
+              if (out && out.satoshis && out.satoshis > 0) {
+                this.dispatchWallet.addUtxo({
+                  txid, vout: idx, satoshis: out.satoshis,
+                  script: p2pkHex,
+                  sourceTransaction: tx,
+                });
+              }
+            }
+          });
+        }
+
+        return { tx, txid, result };
+      } catch (err) {
+        lastErr = err;
+        // Mark these UTXOs as failed so next pick skips them
+        const now = Date.now();
         for (const snap of snapshots) {
-          this.dispatchWallet.addUtxo(snap);
+          this._failedUtxos.set(`${snap.txid}:${snap.vout}`, now);
         }
-      });
-      throw err;
-    }
-
-    // Phase 3: add output UTXOs back to wallet (under lock)
-    if (walletOuts.length > 0) {
-      await this.withSpendLock(async () => {
-        const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
-        for (const idx of walletOuts) {
-          const out = tx.outputs[idx];
-          if (out && out.satoshis && out.satoshis > 0) {
-            this.dispatchWallet.addUtxo({
-              txid, vout: idx, satoshis: out.satoshis,
-              script: p2pkHex,
-              sourceTransaction: tx,
-            });
+        // Rollback: restore spent UTXOs (will be skipped by pickWalletUtxos on next attempt)
+        await this.withSpendLock(async () => {
+          for (const snap of snapshots) {
+            this.dispatchWallet.addUtxo(snap);
           }
-        }
-      });
+        });
+        // Try again with different UTXOs
+      }
     }
 
-    return { tx, txid, result };
+    throw lastErr || new Error('walletTxWithRollback: all attempts failed');
   }
 
   /**
@@ -877,8 +909,10 @@ export class DispatchManager {
     // Create fee UTXOs for the agent to broadcast the chain
     // chainLength includes genesis — fee UTXOs only needed for chain steps
     const chainSteps = chainLength - 1;
-    // Estimate fee from average chain TX size (~4500 bytes at 100 sats/kB)
-    const feePerStep = Math.ceil((4500 + 150) * FEE_RATE_SATS_PER_KB / 1000) + 5;
+    // Estimate fee with generous margin — chain TX sizes vary widely with molecule atom count.
+    // Some molecules produce ~5800 byte chain TXs; we use 6500 to be safe.
+    // Overpaying ~50 sats per step is cheap insurance against "fee too low" rejections.
+    const feePerStep = Math.ceil((6500 + 150) * FEE_RATE_SATS_PER_KB / 1000) + 20;
 
     try {
       const feeUtxos = await this.createFeeUtxos(agent.pubkey, chainSteps, feePerStep);

@@ -607,7 +607,16 @@ async function refresh(){
 
   }catch(e){console.error('refresh',e)}
 }
-setInterval(refresh,500);
+// Refresh cadence: 2s when visible, 10s when hidden.
+// Was 500ms which saturated Cloudflare tunnel at 10 req/sec × N tabs.
+let _refreshTimer = null;
+function scheduleRefresh() {
+  if (_refreshTimer) clearInterval(_refreshTimer);
+  const interval = document.visibilityState === 'hidden' ? 10000 : 2000;
+  _refreshTimer = setInterval(refresh, interval);
+}
+document.addEventListener('visibilitychange', scheduleRefresh);
+scheduleRefresh();
 refresh();
 
 // Expose entry points for inline onclick handlers (module scope doesn't leak to window automatically).
