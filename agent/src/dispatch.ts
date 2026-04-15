@@ -780,10 +780,8 @@ export class DispatchManager {
       this.pushEvent({ type: 'spot_check_fail', agentName: agent.name, agentId, moleculeId: work.molecule.id });
     }
 
-    // Fire-and-forget reward payment — don't block the agent
-    this.payReward(agent, REWARD_BASE_SATS).catch(err => {
-      console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
-    });
+    // Fire-and-forget reward — walletTxWithRollback handles failure rollback internally
+    this.payReward(agent, REWARD_BASE_SATS).catch(() => {/* logged inside payReward */});
 
     this.markTested(work);
     this.pushEvent({ type: 'fail', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore });
@@ -846,10 +844,8 @@ export class DispatchManager {
       // Pass reward: base + per-chain-step bonus (genesis is not a step)
       const chainSteps = chainTxHexes.length - 1;
       const passReward = REWARD_BASE_SATS + (REWARD_PER_CHAIN_TX_SATS * chainSteps);
-      // Fire-and-forget reward — don't block the agent
-      this.payReward(agent, passReward).catch(err => {
-        console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
-      });
+      // Fire-and-forget reward — walletTxWithRollback handles failure rollback internally
+      this.payReward(agent, passReward).catch(() => {/* logged inside payReward */});
       this.markTested(work);
       this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore, rewardSats: passReward });
       this.persistState();
@@ -879,10 +875,8 @@ export class DispatchManager {
 
       // Pass reward: base + per-chain-step bonus (genesis is not a step)
       const passReward = REWARD_BASE_SATS + (REWARD_PER_CHAIN_TX_SATS * chainSteps);
-      // Fire-and-forget reward — don't block the agent
-      this.payReward(agent, passReward).catch(err => {
-        console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
-      });
+      // Fire-and-forget reward — walletTxWithRollback handles failure rollback internally
+      this.payReward(agent, passReward).catch(() => {/* logged inside payReward */});
 
       this.markTested(work);
       this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore, rewardSats: passReward });
@@ -996,29 +990,32 @@ export class DispatchManager {
     agentLockScript = new P2PKH().lock(destination);
     console.log(`[dispatch] Paying ${agent.name} ${rewardSats} sats → ${destination}`);
 
-    // Parallel-safe: pick+sign under lock, broadcast outside
-    const { txid } = await this.walletTxWithRollback(async (picked) => {
-      const tx = new Transaction();
-      tx.version = 2;
-      for (let i = 0; i < picked.utxos.length; i++) {
-        tx.addInput({
-          sourceTransaction: picked.utxos[i].sourceTransaction,
-          sourceOutputIndex: picked.utxos[i].vout,
-          unlockingScriptTemplate: picked.unlockTemplates[i],
-        });
-      }
-      tx.addOutput({ lockingScript: agentLockScript, satoshis: rewardSats });
-      tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
-      await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-      await tx.sign();
-      return { tx, walletOuts: [1], result: null };
-    }, rewardSats + 200);
-    await this.network.mine(1);
-    agent.totalRewardsSats += rewardSats;
-    const dest = destination || `P2PK(${agent.pubkey.slice(0, 8)}...)`;
-    console.log(`[dispatch] Paid ${rewardSats} sats to ${agent.name} → ${dest} (total: ${agent.totalRewardsSats} sats) txid=${txid}`);
-    this.pushEvent({ type: 'reward', agentName: agent.name, agentId: agent.id, rewardSats });
-    return txid;
+    try {
+      const { txid } = await this.walletTxWithRollback(async (picked) => {
+        const tx = new Transaction();
+        tx.version = 2;
+        for (let i = 0; i < picked.utxos.length; i++) {
+          tx.addInput({
+            sourceTransaction: picked.utxos[i].sourceTransaction,
+            sourceOutputIndex: picked.utxos[i].vout,
+            unlockingScriptTemplate: picked.unlockTemplates[i],
+          });
+        }
+        tx.addOutput({ lockingScript: agentLockScript, satoshis: rewardSats });
+        tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
+        await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
+        await tx.sign();
+        return { tx, walletOuts: [1], result: null };
+      }, rewardSats + 200);
+      await this.network.mine(1);
+      agent.totalRewardsSats += rewardSats;
+      console.log(`[dispatch] Paid ${rewardSats} sats to ${agent.name} → ${destination} (total: ${agent.totalRewardsSats} sats) txid=${txid}`);
+      this.pushEvent({ type: 'reward', agentName: agent.name, agentId: agent.id, rewardSats });
+      return txid;
+    } catch (err: any) {
+      console.log(`[dispatch] Reward payment failed for ${agent.name}: ${err.message}`);
+      throw err;
+    }
   }
 
   // --- Spot-check Verification ---

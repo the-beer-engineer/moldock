@@ -314,23 +314,8 @@ function showMolModal(jsonStrOrEl) {
     } catch {}
   }
 
-  function patchStartButton() {
-    const original = window.toggleBrowserAgent;
-    if (!original) return setTimeout(patchStartButton, 200);
-    window.toggleBrowserAgent = function(...args) {
-      const result = original.apply(this, args);
-      setTimeout(() => {
-        if (window.browserAgentRunning) {
-          const name = (document.getElementById('ba-name')?.value || '').trim();
-          const address = (document.getElementById('ba-paymail')?.value || '').trim();
-          if (name) sessionStorage.setItem(RUNNING_KEY, JSON.stringify({ name, address }));
-        } else {
-          sessionStorage.removeItem(RUNNING_KEY);
-        }
-      }, 100);
-      return result;
-    };
-  }
+  // sessionStorage save now happens directly inside toggleBrowserAgent;
+  // no wrapper patching needed.
 
   async function checkVersion() {
     try {
@@ -353,13 +338,11 @@ function showMolModal(jsonStrOrEl) {
   }
 
   window.addEventListener('load', () => {
-    // Clean up old localStorage from prior buggy version (which caused all tabs
-    // to use the same agent name).
+    // Clean up old localStorage from prior buggy version (shared across tabs).
     try {
       localStorage.removeItem('moldock_agent_running');
       localStorage.removeItem('moldock_server_version');
     } catch {}
-    patchStartButton();
     tryAutoStart();
     checkVersion();
     setInterval(checkVersion, 10000);
@@ -621,6 +604,7 @@ Object.defineProperty(window, 'browserAgentRunning', { get: () => browserAgentRu
 // submits results. No @bsv/sdk needed in browser — energy.ts is pure math.
 
 let browserAgentRunning = false;
+let browserRunToken = 0; // increments on Start; loops check this to exit cleanly on Stop
 let browserAgentId = null;
 let browserPrivKey = null;   // BSV PrivateKey instance
 let browserPubKeyHex = null; // 33-byte compressed pubkey hex
@@ -663,6 +647,8 @@ async function toggleBrowserAgent() {
     $('ba-status').textContent = 'stopped';
     const nameDisplayStop = document.getElementById('ba-name-display');
     if (nameDisplayStop) nameDisplayStop.textContent = '';
+    // Clear sessionStorage so we don't auto-restart on reload
+    try { sessionStorage.removeItem('moldock_agent_running'); } catch {}
     baLog('Agent stopped.', '#ff6644');
     return;
   }
@@ -700,6 +686,8 @@ async function toggleBrowserAgent() {
 
   // Start
   browserAgentRunning = true;
+  browserRunToken++; // signal old loops to exit
+  const myToken = browserRunToken;
   $('start-btn').textContent = 'Stop';
   $('start-btn').className = 'stop-btn';
   $('agent-inputs').style.display = 'none';
@@ -709,6 +697,10 @@ async function toggleBrowserAgent() {
   // Show agent name in the header
   const nameDisplay = document.getElementById('ba-name-display');
   if (nameDisplay) nameDisplay.textContent = '— ' + agentName;
+  // Save state for auto-restart on page reload (per-tab via sessionStorage)
+  try {
+    sessionStorage.setItem('moldock_agent_running', JSON.stringify({ name: agentName, address: paymail || '' }));
+  } catch {}
 
   // Generate session keypair
   browserPrivKey = BSV.PrivateKey.fromRandom();
@@ -755,7 +747,7 @@ async function toggleBrowserAgent() {
     baLog('Registered! ID: ' + browserAgentId, '#00ff88');
 
     // Work loop
-    await browserWorkLoop();
+    await browserWorkLoop(myToken);
   } catch (err) {
     baLog('Error: ' + err.message, '#ff4444');
     browserAgentRunning = false;
@@ -906,11 +898,11 @@ async function broadcastChainBrowser(stepTxs) {
   return bcastRes;
 }
 
-async function browserWorkLoop() {
+async function browserWorkLoop(myToken) {
   // Prefetch pipeline: while we broadcast molecule N, we already fetch+compute+build molecule N+1.
   let nextPrepPromise = prepareNextWork(null);
 
-  while (browserAgentRunning) {
+  while (browserAgentRunning && myToken === browserRunToken) {
     let prep = null;
     try {
       $('ba-status').textContent = 'waiting for prep...';
