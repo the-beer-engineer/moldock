@@ -637,6 +637,7 @@ let browserPrivKey = null;   // BSV PrivateKey instance
 let browserPubKeyHex = null; // 33-byte compressed pubkey hex
 let browserNetwork = 'regtest';
 let browserArc = null;       // BSV.ARC instance when network != regtest
+let browserArcEndpoints = []; // list of Arcade URLs to rotate through
 let baStats = { molecules: 0, passed: 0, failed: 0, txs: 0, earned: 0 };
 const baScoreHistory = [];
 const baBodyHexCache = new Map();
@@ -732,12 +733,19 @@ async function toggleBrowserAgent() {
     baLog('Discovered dispatch on ' + browserNetwork, '#88cc88');
     if (browserNetwork !== 'regtest') {
       // Arcade broadcast: use Extended Format (EF) directly to Arcade.
-      // GorillaPool ARC accepts raw but never relays to miners.
-      const arcadeUrl = browserNetwork === 'mainnet'
-        ? 'https://arcade-us-1.bsvb.tech'
-        : 'https://arcade-testnet-us-1.bsvb.tech';
-      browserArc = { URL: arcadeUrl }; // flag for broadcastChainBrowser
-      baLog('Arcade broadcast enabled: ' + arcadeUrl, '#00ff88');
+      // Multiple endpoints rotate per request for load balancing & resilience.
+      browserArcEndpoints = browserNetwork === 'mainnet'
+        ? [
+            'https://arcade-us-1.bsvb.tech',
+            'https://arcade-eu-1.bsvb.tech',
+            'https://arcade-ttn-us-1.bsvb.tech',
+          ]
+        : [
+            'https://arcade-testnet-us-1.bsvb.tech',
+            'https://arcade-ttn-us-1.bsvb.tech',
+          ];
+      browserArc = { URL: browserArcEndpoints[0] }; // flag for broadcastChainBrowser
+      baLog('Arcade broadcast enabled: ' + browserArcEndpoints.length + ' endpoints', '#00ff88');
     }
   } catch (e) {
     baLog('Discover failed: ' + e.message, '#ff6644');
@@ -812,40 +820,63 @@ async function broadcastChainBrowser(stepTxs) {
   }
 
   if (browserArc && stepTxs.length > 0 && typeof stepTxs[0] !== 'string') {
-    // Arcade broadcast with Extended Format (EF) — only when we have Transaction objects
-    // with sourceTransaction references (from rebuildChainWithFees).
-    // Sequential: each chain step spends the previous step's output.
-    const arcadeUrl = browserArc.URL;
-    for (let i = 0; i < stepTxs.length; i++) {
-      const efHex = stepTxs[i].toHexEF();
+    // Arcade broadcast with Extended Format (EF). Multiple endpoints rotate per request
+    // for load balancing. Parallel waves of N — TXs depend on each other but Arcade is
+    // generally OK accepting them slightly out of order with a brief retry on "missing parent".
+    const ARCADE_ENDPOINTS = browserArcEndpoints;
+    const WAVE = 4; // concurrent broadcasts per wave
+    let endpointIdx = 0;
+
+    async function sendOne(efHex, idx) {
       const body = Uint8Array.from(efHex.match(/.{2}/g).map(b => parseInt(b, 16)));
-      let success = false;
-      for (let attempt = 0; attempt < 8; attempt++) {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const url = ARCADE_ENDPOINTS[(endpointIdx + idx + attempt) % ARCADE_ENDPOINTS.length];
         try {
-          const r = await fetch(arcadeUrl + '/tx', {
+          const r = await fetch(url + '/tx', {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
             body: body,
           });
-          if (r.ok) { success = true; break; }
+          if (r.ok) return null;
           const errText = await r.text();
-          // SQLITE_BUSY and other 5xx: retry with exponential backoff
-          if (r.status >= 500 && attempt < 7) {
-            const waitMs = 200 + Math.random() * 500 * Math.pow(2, attempt);
-            await new Promise(res => setTimeout(res, waitMs));
-            continue;
+          // 5xx (SQLITE_BUSY) or "missing parent" — retry with backoff
+          if (r.status >= 500 || /missing|unknown|previous/i.test(errText)) {
+            if (attempt < 5) {
+              const waitMs = 150 + Math.random() * 300 * Math.pow(2, attempt);
+              await new Promise(res => setTimeout(res, waitMs));
+              continue;
+            }
           }
-          return { ok: false, error: 'arcade step ' + i + ': Arcade ' + r.status + ': ' + errText.slice(0, 200) };
+          return { error: 'Arcade ' + r.status + ': ' + errText.slice(0, 200) };
         } catch (e) {
-          // Network error — retry
-          if (attempt < 7) {
-            await new Promise(res => setTimeout(res, 500 * (attempt + 1)));
+          if (attempt < 5) {
+            await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
             continue;
           }
-          return { ok: false, error: 'arcade step ' + i + ' network: ' + String(e.message || e) };
+          return { error: 'network: ' + String(e.message || e) };
         }
       }
-      if (!success) return { ok: false, error: 'arcade step ' + i + ' retries exhausted' };
+      return { error: 'retries exhausted' };
+    }
+
+    // Pre-serialize all TXs to EF
+    const efHexes = stepTxs.map(tx => tx.toHexEF());
+
+    // Send in parallel waves (chain TXs are dependent but Arcade tolerates brief reordering)
+    for (let start = 0; start < efHexes.length; start += WAVE) {
+      const slice = efHexes.slice(start, start + WAVE);
+      const results = await Promise.allSettled(
+        slice.map((hex, j) => sendOne(hex, start + j))
+      );
+      for (let j = 0; j < results.length; j++) {
+        const r = results[j];
+        if (r.status === 'rejected' || (r.status === 'fulfilled' && r.value)) {
+          const msg = r.status === 'rejected' ? String(r.reason?.message || r.reason) : r.value.error;
+          if (/too.long.mempool|chain.too.long|limit.?ancestor/i.test(msg)) baBackoffUntil = Date.now() + 3500;
+          return { ok: false, error: 'arcade step ' + (start + j) + ': ' + msg };
+        }
+      }
+      endpointIdx = (endpointIdx + WAVE) % ARCADE_ENDPOINTS.length;
     }
     return { ok: true };
   }

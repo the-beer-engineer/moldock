@@ -57,6 +57,8 @@ const ARC_ENDPOINTS: Record<'testnet' | 'mainnet', string[]> = {
   ],
   mainnet: [
     'https://arcade-us-1.bsvb.tech',
+    'https://arcade-eu-1.bsvb.tech',
+    'https://arcade-ttn-us-1.bsvb.tech',
   ],
 };
 
