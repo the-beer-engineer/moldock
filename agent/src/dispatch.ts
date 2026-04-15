@@ -356,54 +356,62 @@ export class DispatchManager {
     build: (picked: { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number }) => Promise<{ tx: Transaction; walletOuts: number[]; result: T }>,
     minSats: number,
   ): Promise<{ tx: Transaction; txid: string; result: T }> {
-    const MAX_ATTEMPTS = 2; // budget: 2 × ~8s Arcade = ~16s, fits in browser 30s /pass timeout
+    const MAX_ATTEMPTS = 3; // pick retries + broadcast retries
     let lastErr: any;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      // Phase 1: pick + sign + mark spent (under lock)
-      let phase1: { tx: Transaction; walletOuts: number[]; result: T; snapshots: UTXO[] } | null = null;
+      // Phase 1: pick + sign + optimistically add change (all under lock)
+      let phase1: { tx: Transaction; walletOuts: number[]; result: T; snapshots: UTXO[]; addedOuts: Array<{txid:string; vout:number}> } | null = null;
+      let pickFailed = false;
       try {
         phase1 = await this.withSpendLock(async () => {
           const picked = this.pickWalletUtxos(minSats);
-          if (!picked) throw new Error(`No funding available (need ${minSats} sats, have ${this.dispatchWallet.balance})`);
+          if (!picked) throw new Error(`NO_FUNDING:${minSats}`);
           const snapshots = picked.utxos.map(u => ({ ...u }));
           const { tx, walletOuts, result } = await build(picked);
+          // Mark spent
           for (const u of picked.utxos) this.dispatchWallet.spendUtxo(u.txid, u.vout);
-          return { tx, walletOuts, result, snapshots };
+          // OPTIMISTICALLY add change UTXO under the lock — prevents transient wallet
+          // exhaustion while the broadcast is in flight. Rolled back on broadcast failure.
+          const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
+          const txid = tx.id('hex');
+          const addedOuts: Array<{txid:string; vout:number}> = [];
+          for (const idx of walletOuts) {
+            const out = tx.outputs[idx];
+            if (out && out.satoshis && out.satoshis > 0) {
+              this.dispatchWallet.addUtxo({
+                txid, vout: idx, satoshis: out.satoshis,
+                script: p2pkHex, sourceTransaction: tx,
+              });
+              addedOuts.push({ txid, vout: idx });
+            }
+          }
+          return { tx, walletOuts, result, snapshots, addedOuts };
         });
-      } catch (err) {
+      } catch (err: any) {
         lastErr = err;
-        throw err; // pick errors aren't retryable
+        if (String(err?.message || '').startsWith('NO_FUNDING')) {
+          // Wallet is transiently exhausted (other in-flight TXs). Wait and retry.
+          pickFailed = true;
+          if (attempt < MAX_ATTEMPTS - 1) {
+            await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+            continue;
+          }
+          throw new Error(`No funding available (need ${minSats} sats, have ${this.dispatchWallet.balance})`);
+        }
+        throw err;
       }
+      if (pickFailed || !phase1) continue;
 
-      const { tx, walletOuts, result, snapshots } = phase1;
+      const { tx, result, snapshots, addedOuts } = phase1;
 
       // Phase 2: broadcast (outside lock)
       try {
         const txid = await this.network.broadcast(tx);
-
-        // Phase 3: add output UTXOs back to wallet
-        if (walletOuts.length > 0) {
-          await this.withSpendLock(async () => {
-            const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
-            for (const idx of walletOuts) {
-              const out = tx.outputs[idx];
-              if (out && out.satoshis && out.satoshis > 0) {
-                this.dispatchWallet.addUtxo({
-                  txid, vout: idx, satoshis: out.satoshis,
-                  script: p2pkHex,
-                  sourceTransaction: tx,
-                });
-              }
-            }
-          });
-        }
-
         return { tx, txid, result };
       } catch (err: any) {
         lastErr = err;
-        // Only blacklist UTXOs when the error is UTXO-specific (bad ancestor chain, etc).
-        // Don't blacklist on transient errors (SQLITE_BUSY, timeouts, connection errors).
+        // Only blacklist UTXOs when the error is UTXO-specific.
         const errMsg = String(err?.message || '');
         const isUtxoSpecific = /failed to validate|missing|unknown.*input|previous|parent/i.test(errMsg);
         if (isUtxoSpecific) {
@@ -412,8 +420,11 @@ export class DispatchManager {
             this._failedUtxos.set(`${snap.txid}:${snap.vout}`, now);
           }
         }
-        // Rollback: restore spent UTXOs
+        // Rollback: remove the optimistically-added outputs AND restore spent inputs
         await this.withSpendLock(async () => {
+          for (const out of addedOuts) {
+            this.dispatchWallet.spendUtxo(out.txid, out.vout);
+          }
           for (const snap of snapshots) {
             this.dispatchWallet.addUtxo(snap);
           }
