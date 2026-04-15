@@ -1028,13 +1028,15 @@ async function parallelChainWorker(myToken, workerId) {
         try {
           const ctrl = new AbortController();
           const timer = setTimeout(() => ctrl.abort(), 30000); // 30s timeout
+          // Minimal payload: just workId, score, and chain length.
+          // Sending chainTxHexes was burning ~100KB/call through Cloudflare tunnel.
           const r = await fetch('/api/agent/' + browserAgentId + '/pass', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
               workId: work.id,
               finalScore: totalScore,
-              chainTxHexes: chain.txHexes,
+              chainLength: chain.txHexes.length,
               alreadyBroadcast: false,
             }),
             signal: ctrl.signal,

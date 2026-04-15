@@ -271,7 +271,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
     const agentId = passMatch[1];
     const body = JSON.parse(await readBody(req));
-    const result = await dispatch.submitPass(agentId, body.workId, body.finalScore, body.chainTxHexes ?? [], body.alreadyBroadcast === true);
+    // chainLength is the new minimal payload; chainTxHexes still accepted for backwards compat
+    const chainLen = body.chainLength ?? (Array.isArray(body.chainTxHexes) ? body.chainTxHexes.length : 0);
+    const result = await dispatch.submitPass(agentId, body.workId, body.finalScore, chainLen, body.alreadyBroadcast === true);
     if (!result.ok) { json(res, { error: result.error }, 400); return; }
     json(res, { ok: true, reward: result.reward, feePackage: result.feePackage });
     return;

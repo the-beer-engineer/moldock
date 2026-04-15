@@ -827,7 +827,7 @@ export class DispatchManager {
 
   async submitPass(
     agentId: string, workId: string, finalScore: number,
-    chainTxHexes: string[],
+    chainLength: number, // total TX count including genesis (was chainTxHexes.length)
     alreadyBroadcast: boolean = false,
   ): Promise<{ ok: boolean; reward?: number; feePackage?: FeePackage; error?: string }> {
     const agent = this.agents.get(agentId);
@@ -842,11 +842,10 @@ export class DispatchManager {
     agent.totalPassed++;
     agent.lastSeen = new Date().toISOString();
 
-    // Track bytes from chain TX hexes
-    const chainBytes = chainTxHexes.reduce((s, h) => s + Math.floor(h.length / 2), 0);
-    agent.totalBytes += chainBytes;
+    // Approximate chain bytes — chain TXs are ~4500 bytes each on average
+    agent.totalBytes += chainLength * 4500;
 
-    // Spot-check: re-execute the energy calculation
+    // Spot-check uses molecule/receptor from work package, not the chain hex
     const verified = this.spotCheckScore(work);
     if (!verified) {
       console.log(`[dispatch] SPOT CHECK FAILED for ${agent.name} on ${workId}! Rejecting pass.`);
@@ -859,24 +858,15 @@ export class DispatchManager {
     }
 
     // Browser-agent fast path: agent already broadcast chain directly.
-    // Skip fee UTXO creation entirely (browser uses 1-sat simple chain on regtest
-    // or pays its own fees on testnet/mainnet via ARC).
     if (alreadyBroadcast) {
-      // Store full chain hex so dispatch can re-broadcast later if TXs are lost.
-      work.chainTxHexes = chainTxHexes;
       work.broadcastAt = performance.now();
-      work.rebroadcastCount = 0;
       work.status = 'verified';
-      // chainTxHexes includes genesis, so total TXs = chainTxHexes.length
-      // chain steps (excluding genesis) = chainTxHexes.length - 1
-      agent.totalTxsBroadcast += chainTxHexes.length;
+      agent.totalTxsBroadcast += chainLength;
       if (agent.totalPassed >= 5 && agent.trustLevel < 1) agent.trustLevel = 1;
       if (agent.totalPassed >= 20 && agent.trustLevel < 2) agent.trustLevel = 2;
-      // Pass reward: base + per-chain-step bonus (genesis is not a step)
-      const chainSteps = chainTxHexes.length - 1;
+      const chainSteps = chainLength - 1;
       const passReward = REWARD_BASE_SATS + (REWARD_PER_CHAIN_TX_SATS * chainSteps);
-      // Fire-and-forget reward — walletTxWithRollback handles failure rollback internally
-      this.payReward(agent, passReward).catch(() => {/* logged inside payReward */});
+      this.payReward(agent, passReward).catch(() => {});
       this.markTested(work);
       this.pushEvent({ type: 'pass', agentName: agent.name, agentId, moleculeId: work.molecule.id, score: finalScore, rewardSats: passReward });
       this.persistState();
@@ -885,9 +875,10 @@ export class DispatchManager {
     }
 
     // Create fee UTXOs for the agent to broadcast the chain
-    // chainTxHexes includes genesis at index 0 — fee UTXOs only needed for chain steps
-    const chainSteps = chainTxHexes.length - 1;
-    const feePerStep = this.estimateFeePerStep(chainTxHexes);
+    // chainLength includes genesis — fee UTXOs only needed for chain steps
+    const chainSteps = chainLength - 1;
+    // Estimate fee from average chain TX size (~4500 bytes at 100 sats/kB)
+    const feePerStep = Math.ceil((4500 + 150) * FEE_RATE_SATS_PER_KB / 1000) + 5;
 
     try {
       const feeUtxos = await this.createFeeUtxos(agent.pubkey, chainSteps, feePerStep);
@@ -898,7 +889,7 @@ export class DispatchManager {
       };
 
       work.status = 'verified';
-      agent.totalTxsBroadcast += chainTxHexes.length; // genesis + chain steps
+      agent.totalTxsBroadcast += chainLength; // genesis + chain steps
 
       // Bump trust for consistent passes
       if (agent.totalPassed >= 5 && agent.trustLevel < 1) agent.trustLevel = 1;
