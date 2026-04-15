@@ -273,16 +273,23 @@ export class DispatchManager {
    * Returns inputs ready to add to a Transaction.
    */
   private pickWalletUtxos(minSats: number): { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number } | null {
-    // Expire failed-UTXO blacklist entries older than 10 min
+    // Expire failed-UTXO blacklist entries older than 2 min (was 10 min — too sticky)
     const now = Date.now();
-    const BLACKLIST_TTL = 10 * 60 * 1000;
+    const BLACKLIST_TTL = 2 * 60 * 1000;
     for (const [k, t] of this._failedUtxos.entries()) {
       if (now - t > BLACKLIST_TTL) this._failedUtxos.delete(k);
     }
-    const blacklisted = this._failedUtxos;
-    const available = this.dispatchWallet.getUtxos()
-      .filter(u => u.sourceTransaction && !blacklisted.has(`${u.txid}:${u.vout}`))
-      .sort((a, b) => a.satoshis - b.satoshis); // smallest first — avoid wasting big UTXOs
+    const allUtxos = this.dispatchWallet.getUtxos().filter(u => u.sourceTransaction);
+    let available = allUtxos
+      .filter(u => !this._failedUtxos.has(`${u.txid}:${u.vout}`))
+      .sort((a, b) => a.satoshis - b.satoshis);
+
+    // Safety valve: if blacklist ate everything, clear it and retry
+    if (available.length === 0 && allUtxos.length > 0) {
+      console.log(`[dispatch] All ${allUtxos.length} UTXOs blacklisted — clearing blacklist`);
+      this._failedUtxos.clear();
+      available = allUtxos.sort((a, b) => a.satoshis - b.satoshis);
+    }
     if (available.length === 0) return null;
 
     // Try single UTXO first (cheapest — fewer inputs = lower fee)
@@ -393,20 +400,24 @@ export class DispatchManager {
         }
 
         return { tx, txid, result };
-      } catch (err) {
+      } catch (err: any) {
         lastErr = err;
-        // Mark these UTXOs as failed so next pick skips them
-        const now = Date.now();
-        for (const snap of snapshots) {
-          this._failedUtxos.set(`${snap.txid}:${snap.vout}`, now);
+        // Only blacklist UTXOs when the error is UTXO-specific (bad ancestor chain, etc).
+        // Don't blacklist on transient errors (SQLITE_BUSY, timeouts, connection errors).
+        const errMsg = String(err?.message || '');
+        const isUtxoSpecific = /failed to validate|missing|unknown.*input|previous|parent/i.test(errMsg);
+        if (isUtxoSpecific) {
+          const now = Date.now();
+          for (const snap of snapshots) {
+            this._failedUtxos.set(`${snap.txid}:${snap.vout}`, now);
+          }
         }
-        // Rollback: restore spent UTXOs (will be skipped by pickWalletUtxos on next attempt)
+        // Rollback: restore spent UTXOs
         await this.withSpendLock(async () => {
           for (const snap of snapshots) {
             this.dispatchWallet.addUtxo(snap);
           }
         });
-        // Try again with different UTXOs
       }
     }
 

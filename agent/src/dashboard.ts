@@ -707,17 +707,8 @@ async function toggleBrowserAgent() {
   }
   nameInput.style.borderColor = '#1a3a1a';
 
-  // Check name availability
-  try {
-    const check = await fetch('/api/agent/check-name/' + encodeURIComponent(agentName)).then(r => r.json());
-    if (!check.available) {
-      nameInput.style.borderColor = '#ff4444';
-      baLog('Name "' + agentName + '" is already taken. Choose another.', '#ff4444');
-      $('browser-log').style.display = 'block';
-      nameInput.focus();
-      return;
-    }
-  } catch {}
+  // Note: server reuses existing agent record if same name re-registers (e.g. stop/start).
+  // No name-availability check needed — the register call handles it.
 
   if (!BSV) {
     baLog('BSV SDK failed to load from CDN. Browser agent unavailable.', '#ff4444');
