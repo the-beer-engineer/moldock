@@ -776,8 +776,9 @@ async function toggleBrowserAgent() {
 }
 
 // Local queue of pre-fetched work packages. Refilled in batches to amortize Cloudflare RTT.
+// With PARALLEL_CHAINS=5 workers, we want to keep the queue topped up.
 let workQueue = [];
-const WORK_BATCH_SIZE = 5;
+const WORK_BATCH_SIZE = 10;
 
 async function fetchWorkBatch() {
   try {
@@ -925,19 +926,36 @@ async function broadcastChainBrowser(stepTxs) {
   return bcastRes;
 }
 
+// Number of molecules to process in parallel per browser tab.
+// Each chain is internally sequential (no intra-chain races) but multiple
+// chains run concurrently to amortize Cloudflare RTT and keep Arcade busy.
+const PARALLEL_CHAINS = 5;
+
 async function browserWorkLoop(myToken) {
-  // Prefetch pipeline: while we broadcast molecule N, we already fetch+compute+build molecule N+1.
+  // Spawn N parallel workers — each pulls work from the shared queue,
+  // processes one molecule end-to-end, repeats. Independent chains broadcast
+  // concurrently without intra-chain races.
+  const workers = [];
+  for (let w = 0; w < PARALLEL_CHAINS; w++) {
+    workers.push(parallelChainWorker(myToken, w));
+  }
+  await Promise.all(workers);
+}
+
+async function parallelChainWorker(myToken, workerId) {
+  // Each worker has its own pipeline: fetch+compute+build for next molecule
+  // while broadcasting current one.
   let nextPrepPromise = prepareNextWork(null);
 
   while (browserAgentRunning && myToken === browserRunToken) {
     let prep = null;
     try {
-      $('ba-status').textContent = 'waiting for prep...';
+      if (workerId === 0) $('ba-status').textContent = 'wkr0: waiting for prep...';
       prep = await nextPrepPromise;
       nextPrepPromise = null;
 
       if (!prep) {
-        $('ba-status').textContent = 'waiting...';
+        if (workerId === 0) $('ba-status').textContent = 'waiting for work...';
         await new Promise(r => setTimeout(r, 1500));
         nextPrepPromise = prepareNextWork(null);
         continue;
@@ -945,7 +963,7 @@ async function browserWorkLoop(myToken) {
 
       const { work, totalScore, passed, chain, computeMs, buildMs } = prep;
       const molId = work.molecule.id;
-      $('ba-status').textContent = molId.slice(0, 20) + '...';
+      if (workerId === 0) $('ba-status').textContent = molId.slice(0, 20) + '...';
 
       baStats.molecules++;
 
@@ -964,7 +982,7 @@ async function browserWorkLoop(myToken) {
       }
 
       // PASS: request fee UTXOs from dispatch, rebuild chain with fees, then broadcast.
-      $('ba-status').textContent = 'requesting fees...';
+      if (workerId === 0) $('ba-status').textContent = 'requesting fees...';
       const t2 = performance.now();
 
       // Step 1: Submit pass and request fee UTXOs — with timeout + retry
@@ -1026,7 +1044,7 @@ async function browserWorkLoop(myToken) {
       let rebuiltTxObjects = null; // Transaction objects with sourceTransaction for EF
 
       if (feePackage && feePackage.utxos && feePackage.utxos.length > 0) {
-        $('ba-status').textContent = 'adding fees...';
+        if (workerId === 0) $('ba-status').textContent = 'adding fees...';
         try {
           rebuiltTxObjects = await rebuildChainWithFees(chain, feePackage.utxos);
         } catch (rebuildErr) {
@@ -1035,7 +1053,7 @@ async function browserWorkLoop(myToken) {
       }
 
       // Step 3: Broadcast rebuilt chain with fees
-      $('ba-status').textContent = 'broadcasting...';
+      if (workerId === 0) $('ba-status').textContent = 'broadcasting...';
 
       const bcastRes = await broadcastChainBrowser(rebuiltTxObjects || chain.txHexes.slice(1));
       const bcastMs = (performance.now() - t2).toFixed(0);
@@ -1077,7 +1095,7 @@ async function browserWorkLoop(myToken) {
       nextPrepPromise = prepareNextWork(confirmRes.nextWork || null);
 
       baUpdateStats();
-      $('ba-status').textContent = 'idle';
+      if (workerId === 0) $('ba-status').textContent = 'wkr0: idle';
 
     } catch (err) {
       baLog('Error: ' + err.message, '#ff4444');
