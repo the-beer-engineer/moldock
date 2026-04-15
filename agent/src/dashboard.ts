@@ -285,18 +285,15 @@ function showMolModal(jsonStrOrEl) {
 }
 
 // --- Auto-restart watchdog ---
-// Saves agent name/address in localStorage on Start.
-// On page load, if a saved name exists, auto-clicks Start after the page is ready.
+// Uses sessionStorage (per-tab, not shared across browser tabs/windows on same domain).
+// On Start: saves agent name/address. On page reload: auto-clicks Start with saved values.
 // Polls /api/version every 10s; reloads the page when the server restarts (new version).
 (function() {
-  const VERSION_KEY = 'moldock_server_version';
-  const RUNNING_KEY = 'moldock_agent_running';
+  const RUNNING_KEY = 'moldock_agent_running';  // sessionStorage = per-tab
   let lastSeenVersion = null;
-  let pollAttempts = 0;
 
-  // Auto-restart on page load if agent was running
   function tryAutoStart() {
-    const saved = localStorage.getItem(RUNNING_KEY);
+    const saved = sessionStorage.getItem(RUNNING_KEY);
     if (!saved) return;
     try {
       const { name, address } = JSON.parse(saved);
@@ -306,12 +303,10 @@ function showMolModal(jsonStrOrEl) {
       if (nameInput && addrInput && startBtn && name) {
         nameInput.value = name;
         if (address) addrInput.value = address;
-        // Wait briefly for BSV SDK to load, then click Start
         setTimeout(() => {
           if (typeof window.toggleBrowserAgent === 'function') {
             window.toggleBrowserAgent();
           } else {
-            // SDK not loaded yet — try again
             setTimeout(tryAutoStart, 1000);
           }
         }, 1500);
@@ -319,28 +314,24 @@ function showMolModal(jsonStrOrEl) {
     } catch {}
   }
 
-  // Save state when the start button is clicked (intercept)
   function patchStartButton() {
     const original = window.toggleBrowserAgent;
     if (!original) return setTimeout(patchStartButton, 200);
     window.toggleBrowserAgent = function(...args) {
-      const wasRunning = window.browserAgentRunning;
       const result = original.apply(this, args);
-      // Schedule a check after the toggle
       setTimeout(() => {
         if (window.browserAgentRunning) {
           const name = (document.getElementById('ba-name')?.value || '').trim();
           const address = (document.getElementById('ba-paymail')?.value || '').trim();
-          if (name) localStorage.setItem(RUNNING_KEY, JSON.stringify({ name, address }));
+          if (name) sessionStorage.setItem(RUNNING_KEY, JSON.stringify({ name, address }));
         } else {
-          localStorage.removeItem(RUNNING_KEY);
+          sessionStorage.removeItem(RUNNING_KEY);
         }
       }, 100);
       return result;
     };
   }
 
-  // Version watchdog
   async function checkVersion() {
     try {
       const r = await fetch('/api/version', { cache: 'no-store' });
@@ -348,8 +339,6 @@ function showMolModal(jsonStrOrEl) {
       const d = await r.json();
       if (lastSeenVersion === null) {
         lastSeenVersion = d.version;
-        localStorage.setItem(VERSION_KEY, d.version);
-        // Show version in header (formatted as a date)
         const versionEl = document.getElementById('server-version');
         if (versionEl) {
           const dt = new Date(parseInt(d.version, 10));
@@ -358,18 +347,18 @@ function showMolModal(jsonStrOrEl) {
         }
       } else if (d.version !== lastSeenVersion) {
         console.log('[watchdog] Server version changed — reloading');
-        localStorage.setItem(VERSION_KEY, d.version);
-        // Hard reload to bypass cache
         location.reload();
       }
-      pollAttempts = 0;
-    } catch {
-      pollAttempts++;
-      // If server is down for a long time, don't reload yet — wait for it to come back
-    }
+    } catch {}
   }
 
   window.addEventListener('load', () => {
+    // Clean up old localStorage from prior buggy version (which caused all tabs
+    // to use the same agent name).
+    try {
+      localStorage.removeItem('moldock_agent_running');
+      localStorage.removeItem('moldock_server_version');
+    } catch {}
     patchStartButton();
     tryAutoStart();
     checkVersion();
