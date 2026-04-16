@@ -56,8 +56,8 @@ const ARC_ENDPOINTS: Record<'testnet' | 'mainnet', string[]> = {
     'https://arcade-ttn-us-1.bsvb.tech',
   ],
   mainnet: [
+    'https://arc.gorillapool.io/v1',
     'https://arcade-eu-1.bsvb.tech',
-    'https://arcade-ttn-us-1.bsvb.tech',
     'https://arcade-us-1.bsvb.tech',
   ],
 };
@@ -139,6 +139,16 @@ export class ArcAdapter implements NetworkAdapter {
   private networkType: NetworkType;
   private retries: number;
   private retryDelayMs: number;
+  // Circuit breaker: tracks recent SQLITE_BUSY errors. If too many in a short
+  // window, pause all broadcasts. Arcade is overloaded — hammering it makes it worse.
+  private _busyCount = 0;
+  private _busyWindowStart = 0;
+  private _backoffUntil = 0;
+  // Global concurrency limiter: only N broadcasts in flight at once.
+  // Bumped to 8 — user needs 20+ tx/sec throughput.
+  private _inFlight = 0;
+  private _queue: Array<() => void> = [];
+  private readonly MAX_CONCURRENT = 24;
 
   constructor(
     networkType: 'testnet' | 'mainnet',
@@ -150,67 +160,201 @@ export class ArcAdapter implements NetworkAdapter {
     this.retryDelayMs = opts?.retryDelayMs ?? 2000;
   }
 
+  private async acquireSlot(): Promise<void> {
+    if (this._inFlight < this.MAX_CONCURRENT) {
+      this._inFlight++;
+      return;
+    }
+    await new Promise<void>(resolve => this._queue.push(resolve));
+    this._inFlight++;
+  }
+  private releaseSlot(): void {
+    this._inFlight--;
+    const next = this._queue.shift();
+    if (next) next();
+  }
+  private checkCircuitBreaker(): number {
+    const now = Date.now();
+    if (now < this._backoffUntil) {
+      return this._backoffUntil - now;
+    }
+    return 0;
+  }
+  private recordBusy(): void {
+    const now = Date.now();
+    // Reset window every 10s
+    if (now - this._busyWindowStart > 10_000) {
+      this._busyWindowStart = now;
+      this._busyCount = 0;
+    }
+    this._busyCount++;
+    // Trip circuit breaker if >10 SQLITE_BUSY in 10s window
+    if (this._busyCount > 10 && now >= this._backoffUntil) {
+      this._backoffUntil = now + 15_000; // 15s global pause
+      console.log(`[arc-adapter] CIRCUIT BREAKER TRIPPED — ${this._busyCount} SQLITE_BUSY in 10s, pausing broadcasts 15s`);
+    }
+  }
+
   getNetwork(): NetworkType { return this.networkType; }
 
   async broadcast(tx: Transaction): Promise<string> {
-    // Arcade requires Extended Format (EF) — includes source TX data inline.
+    // Check circuit breaker
+    const backoffMs = this.checkCircuitBreaker();
+    if (backoffMs > 0) {
+      await sleep(backoffMs);
+    }
+
+    // Acquire a concurrency slot
+    await this.acquireSlot();
+    try {
+      return await this._broadcastInner(tx);
+    } finally {
+      this.releaseSlot();
+    }
+  }
+
+  /** Check if a specific TX exists on chain (via WoC). Returns:
+   *  'exists' — TX is on chain / mempool
+   *  'missing' — 404, not in WoC view
+   *  'unknown' — couldn't query (network error, 429, etc)
+   */
+  private async _wocTxExists(txid: string): Promise<'exists' | 'missing' | 'unknown'> {
+    const wocBase = this.networkType === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    try {
+      const r = await fetch(`${wocBase}/tx/hash/${txid}`, { signal: AbortSignal.timeout(5000) });
+      if (r.status === 200) return 'exists';
+      if (r.status === 404) return 'missing';
+      return 'unknown';
+    } catch { return 'unknown'; }
+  }
+
+  private async _broadcastInner(tx: Transaction): Promise<string> {
     const efHex = tx.toHexEF();
     const body = Buffer.from(efHex, 'hex');
-    const TIMEOUT_MS = 8000;  // 8s per attempt — arcade-us-1 can be slow
-    const MAX_ATTEMPTS = 2;   // 2 × 3 endpoints × 8s = up to 48s worst case, usually much less
+    const rawHex = tx.toHex();
+    const txid = tx.id('hex');
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      for (const endpoint of this.endpoints) {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    // PRIMARY: Arcade — broadcast to ALL endpoints in parallel.
+    // No rate limits (unlike WoC's ~3/sec). Any endpoint accepting = success.
+    let lastArcadeErr = '';
+    let anyAccepted = false;
+    const arcResults = await Promise.allSettled(
+      this.endpoints.map(async (endpoint) => {
         try {
           const response = await fetch(`${endpoint}/tx`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
             body,
-            signal: controller.signal,
+            signal: AbortSignal.timeout(5_000),
           });
-          clearTimeout(timer);
-
-          // Arcade returns HTTP 200 even for REJECTED — must check txStatus in body
           const respText = await response.text();
           let respJson: any = null;
           try { respJson = JSON.parse(respText); } catch {}
           const txStatus = respJson?.txStatus || '';
           const isAccepted = response.ok && txStatus !== 'REJECTED' && !respJson?.error;
-
-          if (isAccepted) {
-            return respJson?.txid || tx.id('hex');
-          }
-
           const errorMsg = respJson?.extraInfo || respJson?.detail || respJson?.error || respText.slice(0, 200);
-
-          // 4xx client errors (except 429) — don't retry, throw immediately
-          if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-            throw new Error(`Arcade ${response.status}: ${errorMsg}`);
+          if (/SQLITE_BUSY|database is locked/i.test(errorMsg)) this.recordBusy();
+          if (/258.*mempool.conflict|mempool conflict/i.test(errorMsg)) {
+            throw new Error(`MEMPOOL_CONFLICT:${txid}`);
           }
-
-          // 5xx / 429 / REJECTED — retry with backoff
-          if (attempt < MAX_ATTEMPTS) {
-            const waitMs = 200 + Math.random() * 500 * Math.pow(2, attempt - 1);
-            await sleep(Math.min(waitMs, 5000));
-            continue;
-          }
-          throw new Error(`Arcade ${txStatus || response.status}: ${errorMsg}`);
-        } catch (err: any) {
-          clearTimeout(timer);
-          if (err.message?.startsWith('Arcade 4')) throw err;
-          if (attempt === MAX_ATTEMPTS) {
-            throw new Error(`Arcade broadcast failed after ${MAX_ATTEMPTS} attempts: ${err.message}`);
-          }
-          // Network error / timeout — retry
-          const waitMs = 200 + Math.random() * 500 * Math.pow(2, attempt - 1);
-          await sleep(Math.min(waitMs, 5000));
+          return { endpoint, isAccepted, txid: respJson?.txid, errorMsg };
+        } catch (e: any) {
+          if (e.message?.startsWith('MEMPOOL_CONFLICT')) throw e;
+          return { endpoint, isAccepted: false, txid: null, errorMsg: e.message };
         }
+      })
+    );
+    // Check for mempool conflict thrown from any endpoint
+    for (const r of arcResults) {
+      if (r.status === 'rejected' && String(r.reason?.message || '').startsWith('MEMPOOL_CONFLICT')) {
+        throw r.reason;
       }
     }
+    for (const r of arcResults) {
+      if (r.status === 'fulfilled' && r.value.isAccepted) {
+        anyAccepted = true;
+      } else if (r.status === 'fulfilled') {
+        lastArcadeErr = r.value.errorMsg;
+      }
+    }
+    if (anyAccepted) return txid;
 
-    throw new Error('Arcade broadcast: max retries exceeded');
+    // All Arcade endpoints rejected — fall back to WoC.
+    // Arcade/Teranode is currently returning 500 for valid TXs.
+    // WoC has rate limits (~3/sec) but actually accepts valid TXs.
+    const wocBase = this.networkType === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    try {
+      const r = await fetch(`${wocBase}/tx/raw`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txhex: rawHex }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      const txt = await r.text();
+      if (r.status === 200) {
+        return txt.replace(/"/g, '').trim() || txid;
+      }
+      if (/258.*mempool.conflict/i.test(txt)) {
+        throw new Error(`MEMPOOL_CONFLICT:${txid}`);
+      }
+    } catch (err: any) {
+      if (err.message?.startsWith('MEMPOOL_CONFLICT')) throw err;
+    }
+
+    throw new Error(`Broadcast failed: ${lastArcadeErr.slice(0,150)}`);
+  }
+
+  /** Broadcast multiple UNRELATED transactions in a single batch API call.
+   *  Uses Arcade's POST /txs endpoint. Returns array of txids.
+   *  Parent-child TXs MUST NOT be batched — use sequential broadcast() instead. */
+  async broadcastBatchUnrelated(txs: Transaction[]): Promise<string[]> {
+    if (txs.length === 0) return [];
+    if (txs.length === 1) return [await this.broadcast(txs[0])];
+
+    await this.acquireSlot();
+    try {
+      // Build JSON batch: [{rawTx: "<EF hex>"}, ...]
+      const batchBody = txs.map(tx => ({ rawTx: tx.toHexEF() }));
+      const txids = txs.map(tx => tx.id('hex'));
+
+      // Try each endpoint — first success wins
+      for (const endpoint of this.endpoints) {
+        try {
+          const resp = await fetch(`${endpoint}/txs`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(batchBody),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (resp.ok) {
+            return txids;
+          }
+          const respText = await resp.text();
+          // Partial success — some TXs might have been accepted
+          let respJson: any = null;
+          try { respJson = JSON.parse(respText); } catch {}
+          if (Array.isArray(respJson)) {
+            // Per-TX status array
+            const allOk = respJson.every((r: any) => r.txStatus && r.txStatus !== 'REJECTED' && !r.error);
+            if (allOk) return txids;
+          }
+        } catch {}
+      }
+
+      // Batch failed — fall back to individual broadcasts
+      console.log(`[broadcast] Batch /txs failed for ${txs.length} TXs, falling back to individual`);
+      const results: string[] = [];
+      for (const tx of txs) {
+        results.push(await this.broadcast(tx));
+      }
+      return results;
+    } finally {
+      this.releaseSlot();
+    }
   }
 
   async broadcastHex(hex: string): Promise<string> {

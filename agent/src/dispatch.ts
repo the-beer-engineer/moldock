@@ -2,7 +2,7 @@
  * Dispatch system: manages remote agents, distributes work packages,
  * verifies results, and funds fee UTXOs for chain broadcasting.
  */
-import { Transaction, Script, SatoshisPerKilobyte, P2PKH } from '@bsv/sdk';
+import { Transaction, Script, SatoshisPerKilobyte, P2PKH, Hash } from '@bsv/sdk';
 import { Wallet, type UTXO } from './wallet.js';
 import { getCompiledAsm } from './chainBuilder.js';
 import { buildChainLockScript } from './genesis.js';
@@ -141,6 +141,7 @@ export interface WorkPackage {
   compiledAsm: string;
   genesisTxHex: string;     // serialized genesis TX
   genesisTxid: string;
+  genesisVout: number;      // which output of the genesis TX is THIS molecule's covenant (default 0)
   numSteps: number;         // receptor.atoms.length
   status: 'assigned' | 'processing' | 'pass' | 'fail' | 'verified' | 'expired';
   assignedAt: string;
@@ -168,18 +169,23 @@ export interface FeePackage {
 
 const WORK_TIMEOUT_MS = 30 * 60 * 1000; // 30 min timeout for work
 const SPOT_CHECK_RATE = 0.05;            // 5% of submissions get spot-checked
-const FEE_RATE_SATS_PER_KB = parseInt(process.env.FEE_RATE_SATS_PER_KB || '100', 10); // sats/kB — ARC enforces 100 sats/kB minimum
+const FEE_RATE_SATS_PER_KB = parseInt(process.env.FEE_RATE_SATS_PER_KB || '150', 10); // sats/kB — Arcade 465 errors say required is ~100-150
 const FEE_PER_STEP_SATS = 200;          // default estimate: ~1.65KB chain TX × 100 sats/kB ≈ 165, rounded up
 
 export class DispatchManager {
   private agents = new Map<string, RemoteAgent>();
   private agentsByName = new Map<string, string>(); // name → id
   private work = new Map<string, WorkPackage>();
-  private dispatchWallet: Wallet;
+  public dispatchWallet: Wallet;
   private network: NetworkAdapter;
 
   // Pre-compiled ASM cache
   private asmCache = new Map<number, string>();
+
+  // Rolling 60-second TX rate tracker
+  private _txSnapshots: Array<{ time: number; txs: number }> = [];
+  // Last-known chain balance (from scanForDeposits or reconcile). Stable, doesn't flicker.
+  public lastChainBalanceSats = 0;
 
   // Receptor sites (multi-target support)
   private receptors: Map<string, ReceptorSite>;
@@ -252,6 +258,25 @@ export class DispatchManager {
     wallet.onSpend = () => this.persistUtxos();
     wallet.onAdd = () => this.persistUtxos();
 
+    // Seed verify-tx tracker with all loaded UTXOs so verifyWalletTxs() will
+    // sweep any ghosts left over from previous runs. We mark them as "broadcast"
+    // long ago so they're checked immediately. Each unique parent txid is tracked
+    // once with all its vouts, so verification removes all change in one go.
+    const parentTxs = new Map<string, Set<number>>();
+    for (const u of wallet.getUtxos()) {
+      if (!parentTxs.has(u.txid)) parentTxs.set(u.txid, new Set());
+      parentTxs.get(u.txid)!.add(u.vout);
+    }
+    for (const [txid, vouts] of parentTxs) {
+      this._recentWalletTxs.set(txid, {
+        broadcastAt: 0, // very old — verify on first tick
+        walletOuts: [...vouts],
+      });
+    }
+    if (parentTxs.size > 0) {
+      console.log(`[dispatch] Seeded verify-tx tracker with ${parentTxs.size} parent TXs from loaded UTXOs`);
+    }
+
     // Load real molecules or generate synthetic ones
     const real = getRealMolecules(100);
     this.receptors = real.receptors;
@@ -269,34 +294,61 @@ export class DispatchManager {
 
   /**
    * Pick wallet UTXO(s) with at least `minSats` total.
-   * Prefers a single UTXO if available, otherwise combines multiple.
+   * prefer: 'smallest' picks the smallest sufficient UTXO (for genesis — preserve big ones for fees).
+   *         'largest' picks the largest (for fee TXs — more change for future use).
    * Returns inputs ready to add to a Transaction.
    */
-  private pickWalletUtxos(minSats: number): { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number } | null {
+  private pickWalletUtxos(minSats: number, prefer: 'smallest' | 'largest' | 'median' = 'largest'): { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number } | null {
     // Expire failed-UTXO blacklist entries older than 2 min (was 10 min — too sticky)
     const now = Date.now();
     const BLACKLIST_TTL = 2 * 60 * 1000;
     for (const [k, t] of this._failedUtxos.entries()) {
       if (now - t > BLACKLIST_TTL) this._failedUtxos.delete(k);
     }
-    const allUtxos = this.dispatchWallet.getUtxos().filter(u => u.sourceTransaction);
-    // Prefer LARGER UTXOs first — fan-out outputs (~300K sats) are likely to have
-    // confirmed parents. Small change outputs (~100-1K sats) are more likely from
-    // deep unconfirmed chains that Arcade rejects.
+    // Check for new block — clears mempool-conflict blacklist
+    this._checkNewBlock().catch(() => {});
+
+    // Filter: need sourceTransaction, not pending, P2PKH OR P2PK (both are valid inputs —
+    // Teranode only rejects P2PK OUTPUTS, not inputs). Skip mempool-conflict UTXOs.
+    const allUtxos = this.dispatchWallet.getUtxos()
+      .filter(u => u.sourceTransaction && !u.pending)
+      .filter(u => u.script && (u.script.startsWith('76a914') || u.script.startsWith('21')))
+      .filter(u => !this._mempoolConflictUtxos.has(`${u.txid}:${u.vout}`));
+    // Sort by preference:
+    // 'smallest' — ascending (preserve big for fees)
+    // 'largest' — descending (more change for future use)
+    // 'median' — shuffle to pick from the middle (prevents deep ancestor chains)
+    const sortFn = prefer === 'smallest'
+      ? (a: UTXO, b: UTXO) => a.satoshis - b.satoshis
+      : (a: UTXO, b: UTXO) => b.satoshis - a.satoshis;
+
     let available = allUtxos
       .filter(u => !this._failedUtxos.has(`${u.txid}:${u.vout}`))
-      .sort((a, b) => b.satoshis - a.satoshis); // largest first
+      .sort(sortFn);
 
-    // Safety valve: if blacklist ate everything, clear it and retry
-    if (available.length === 0 && allUtxos.length > 0) {
-      console.log(`[dispatch] All ${allUtxos.length} UTXOs blacklisted — clearing blacklist`);
+    // Safety valve: if blacklist starved us, clear it
+    const availableTotal = available.reduce((s, u) => s + u.satoshis, 0);
+    const allUtxosTotal = allUtxos.reduce((s, u) => s + u.satoshis, 0);
+    if (availableTotal < minSats && allUtxosTotal >= minSats) {
+      console.log(`[dispatch] Blacklist starved pick (${available.length}/${allUtxos.length} available). Clearing ${this._failedUtxos.size} entries.`);
       this._failedUtxos.clear();
-      available = allUtxos.sort((a, b) => b.satoshis - a.satoshis);
+      available = allUtxos.sort(sortFn);
     }
     if (available.length === 0) return null;
 
-    // Try single UTXO first (cheapest — fewer inputs = lower fee)
-    const single = available.find(u => u.satoshis >= minSats);
+    // Try single UTXO first.
+    // For 'median': pick from the middle of the sorted array to prevent deep ancestor chains.
+    // Picking smallest creates a chain: small → smaller → smaller. Median spreads picks.
+    let single: UTXO | undefined;
+    if (prefer === 'median') {
+      const eligible = available.filter(u => u.satoshis >= minSats);
+      if (eligible.length > 0) {
+        eligible.sort((a, b) => a.satoshis - b.satoshis);
+        single = eligible[Math.floor(eligible.length / 2)];
+      }
+    } else {
+      single = available.find(u => u.satoshis >= minSats);
+    }
     if (single) {
       const isP2PKH = single.script.length === 50 && single.script.startsWith('76a914');
       const unlock = isP2PKH
@@ -354,22 +406,214 @@ export class DispatchManager {
   // UTXOs that have recently failed broadcast — skipped on subsequent picks.
   // Cleared every 10 min so we eventually retry them.
   private _failedUtxos = new Map<string, number>();
+  // UTXOs with mempool-conflict — a prior TX in mempool already spends them.
+  // Cleared when a new block is detected (mempool settles). Never expire by time.
+  private _mempoolConflictUtxos = new Set<string>();
+  private _lastBlockHeight = 0;
+  // Diagnostic: count of clearPending calls that didn't find their target UTXO
+  private _clearMisses = 0;
+  private _broadcastErrCount = 0;
+  private _phase3Misses = 0;
+  // Tracks wallet TXs we've broadcast that may still be unconfirmed.
+  // Format: txid → { broadcastAt: ms, walletOuts: [vout], checkedAt?: ms }
+  // Used by verifyWalletTxs() to detect ghosts (TXs we think succeeded but didn't).
+  private _recentWalletTxs = new Map<string, { broadcastAt: number; walletOuts: number[]; verified?: boolean }>();
+
+  /** Fan out into a varied pool of UTXOs — small ones for genesis, large ones for fees.
+   *  Runs aggressively: triggers when < 30 P2PKH UTXOs and any UTXO > 500k sats exists. */
+  async fanOutVaried(): Promise<void> {
+    if (this.network.getNetwork() === 'regtest') return;
+    const p2pkh = this.dispatchWallet.getUtxos().filter(u => u.script?.startsWith('76a914'));
+    if (p2pkh.length >= 100) {
+      return; // Enough UTXOs
+    }
+    const big = p2pkh.filter(u => u.satoshis >= 500_000);
+    if (big.length === 0) {
+      return; // No UTXO big enough to split
+    }
+
+    // Build output list: 50 small (10k) + 50 large (500k) = 100 outputs
+    // 200 outputs got rejected by Teranode — keep at 100 which works
+    const SMALL_COUNT = 50;
+    const SMALL_SATS = 10_000;
+    const LARGE_COUNT = 50;
+    const LARGE_SATS = 500_000;
+    const totalOutputSats = (SMALL_COUNT * SMALL_SATS) + (LARGE_COUNT * LARGE_SATS);
+    const minInput = totalOutputSats + 10_000; // buffer for fee + change
+
+    console.log(`[fanout] Creating ${SMALL_COUNT}×${SMALL_SATS} + ${LARGE_COUNT}×${LARGE_SATS} = ${totalOutputSats} sats (${(totalOutputSats/1e8).toFixed(4)} BSV)`);
+
+    try {
+      await this.walletTxWithRollback(async (picked) => {
+        const lockScript = this.dispatchWallet.p2pkhLockingScript();
+        const buildAndSign = async (changeSats: number) => {
+          const tx = new Transaction();
+          tx.version = 2;
+          for (let i = 0; i < picked.utxos.length; i++) {
+            tx.addInput({
+              sourceTransaction: picked.utxos[i].sourceTransaction,
+              sourceOutputIndex: picked.utxos[i].vout,
+              unlockingScriptTemplate: picked.unlockTemplates[i],
+            });
+          }
+          // Small outputs first (indices 0..49)
+          for (let i = 0; i < SMALL_COUNT; i++) {
+            tx.addOutput({ lockingScript: lockScript, satoshis: SMALL_SATS });
+          }
+          // Large outputs (indices 50..99)
+          for (let i = 0; i < LARGE_COUNT; i++) {
+            tx.addOutput({ lockingScript: lockScript, satoshis: LARGE_SATS });
+          }
+          // Change (index 100)
+          tx.addOutput({ lockingScript: lockScript, satoshis: changeSats });
+          await tx.sign();
+          return tx;
+        };
+        let changeSats = picked.totalSats - totalOutputSats - 2000;
+        if (changeSats < 1) throw new Error(`Fanout: insufficient funds (have ${picked.totalSats}, need ${totalOutputSats + 2000})`);
+        let tx = await buildAndSign(changeSats);
+        const fee = Math.ceil(tx.toHex().length / 2 * 150 / 1000) + 50;
+        changeSats = picked.totalSats - totalOutputSats - fee;
+        if (changeSats < 1) throw new Error(`Fanout: fee ${fee} exceeds funds`);
+        tx = await buildAndSign(changeSats);
+        // walletOuts = ALL outputs (100 fan-out + 1 change)
+        const outs = Array.from({ length: SMALL_COUNT + LARGE_COUNT + 1 }, (_, i) => i);
+        return { tx, walletOuts: outs, result: null };
+      }, minInput);
+      console.log(`[fanout] Complete — ${SMALL_COUNT + LARGE_COUNT + 1} outputs created`);
+    } catch (err: any) {
+      console.log(`[fanout] Failed: ${err.message}`);
+    }
+  }
+
+  /** Check if a new block has been mined since last check. Clears mempool-conflict set. */
+  private async _checkNewBlock(): Promise<void> {
+    try {
+      const height = await this.network.getBlockHeight();
+      if (height > this._lastBlockHeight && this._lastBlockHeight > 0) {
+        if (this._mempoolConflictUtxos.size > 0) {
+          console.log(`[block] New block ${height} — clearing ${this._mempoolConflictUtxos.size} mempool-conflict UTXOs`);
+          this._mempoolConflictUtxos.clear();
+          // Scan for new deposits now that mempool has settled
+          this.scanForDeposits().catch(() => {});
+        }
+      }
+      this._lastBlockHeight = height;
+    } catch {}
+  }
+
+  /** Walk a UTXO's spend chain to find the latest unspent output to our address.
+   *  Used to recover from mempool-conflict: our prior broadcast spent the input,
+   *  creating a change output. That change may itself have been spent in further
+   *  broadcasts. We walk until we find the TIP (unspent). */
+  private async _walkAndRecoverTip(txid: string, vout: number): Promise<void> {
+    if (this.network.getNetwork() === 'regtest') return;
+    const wocBase = this.network.getNetwork() === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    const myAddress = this.dispatchWallet.address;
+    let depth = 0;
+
+    while (depth < 50) {
+      try {
+        const r = await fetch(`${wocBase}/tx/hash/${txid}`, { signal: AbortSignal.timeout(5000) });
+        if (!r.ok) return;
+        const d: any = await r.json();
+        const v = d.vout?.[vout];
+        if (!v) return;
+
+        if (!v.spentTxId) {
+          // Found the TIP — add it to wallet if we don't already have it
+          const sats = Math.round(v.value * 1e8);
+          if (sats < 100) return; // skip dust
+          const key = `${txid}:${vout}`;
+          if (this.dispatchWallet.hasUtxo(txid, vout)) return;
+          // Fetch source tx hex
+          const hexR = await fetch(`${wocBase}/tx/${txid}/hex`, { signal: AbortSignal.timeout(5000) });
+          if (!hexR.ok) return;
+          const sourceTx = Transaction.fromHex(await hexR.text());
+          const script = sourceTx.outputs[vout].lockingScript!.toHex();
+          // Only add P2PKH (Teranode rejects P2PK)
+          if (!script.startsWith('76a914')) return;
+          this.dispatchWallet.addUtxo({
+            txid, vout, satoshis: sats, script, sourceTransaction: sourceTx,
+          });
+          console.log(`[walk-recover] Found tip at depth ${depth}: ${txid.slice(0,16)}:${vout} = ${sats} sats`);
+          return;
+        }
+
+        // Follow the spend
+        const spendTxid = v.spentTxId;
+        const sr = await fetch(`${wocBase}/tx/hash/${spendTxid}`, { signal: AbortSignal.timeout(5000) });
+        if (!sr.ok) return;
+        const sd: any = await sr.json();
+        let found = false;
+        for (let i = 0; i < sd.vout.length; i++) {
+          const addrs = sd.vout[i].scriptPubKey?.addresses || [];
+          if (addrs.includes(myAddress) && sd.vout[i].value > 0.0001) {
+            txid = spendTxid;
+            vout = i;
+            found = true;
+            break;
+          }
+        }
+        if (!found) return;
+        depth++;
+      } catch { return; }
+    }
+  }
+
+  /** Check if a tx landed on chain (via WoC /tx/hash/). Returns true if 200. */
+  private async _verifyTxLanded(txid: string): Promise<boolean> {
+    if (this.network.getNetwork() === 'regtest') return true;
+    const wocBase = this.network.getNetwork() === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+    try {
+      const r = await fetch(`${wocBase}/tx/hash/${txid}`, { signal: AbortSignal.timeout(5000) });
+      return r.status === 200;
+    } catch { return false; }
+  }
+
+  /** Debug-only: expose pickWalletUtxos publicly with detailed failure reason */
+  public async debugPickWalletUtxos(minSats: number): Promise<{ success: boolean; reason?: string; totalSats?: number; utxoCount?: number; allUtxosCount?: number; blacklistSize?: number; sourceTxMissing?: number; pendingCount?: number }> {
+    const before = {
+      total: this.dispatchWallet.getUtxos().length,
+      pending: this.dispatchWallet.getUtxos().filter(u => u.pending).length,
+      noSource: this.dispatchWallet.getUtxos().filter(u => !u.sourceTransaction).length,
+      blacklist: this._failedUtxos.size,
+    };
+    const picked = this.pickWalletUtxos(minSats);
+    const after = {
+      total: this.dispatchWallet.getUtxos().length,
+      pending: this.dispatchWallet.getUtxos().filter(u => u.pending).length,
+      noSource: this.dispatchWallet.getUtxos().filter(u => !u.sourceTransaction).length,
+      blacklist: this._failedUtxos.size,
+    };
+    if (picked) {
+      return { success: true, totalSats: picked.totalSats, utxoCount: picked.utxos.length, allUtxosCount: before.total, blacklistSize: before.blacklist, sourceTxMissing: before.noSource, pendingCount: before.pending };
+    }
+    return { success: false, reason: `pick returned null (before: total=${before.total} pending=${before.pending} noSrc=${before.noSource} blacklist=${before.blacklist}) (after: total=${after.total} pending=${after.pending} noSrc=${after.noSource} blacklist=${after.blacklist})`, allUtxosCount: before.total, blacklistSize: before.blacklist, sourceTxMissing: before.noSource, pendingCount: before.pending };
+  }
 
   private async walletTxWithRollback<T>(
     build: (picked: { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number }) => Promise<{ tx: Transaction; walletOuts: number[]; result: T }>,
     minSats: number,
+    pickPrefer: 'smallest' | 'largest' | 'median' = 'largest',
   ): Promise<{ tx: Transaction; txid: string; result: T }> {
-    const MAX_ATTEMPTS = 3; // pick retries + broadcast retries
+    // 3 attempts: enough for transient failures, not enough to hang the request.
+    // MEMPOOL_CONFLICT fails immediately (marks UTXO, doesn't retry same one).
+    const MAX_ATTEMPTS = 3;
     let lastErr: any;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      // Phase 1: pick + sign + mark spent (all under lock)
-      // DO NOT add change optimistically — broken-broadcast rollback races with
-      // persistState's 2s debounce and creates ghost UTXOs on disk.
+      // Phase 1: pick, sign, mark spent (under lock). NO pending change added.
+      // Change gets added as CONFIRMED after broadcast succeeds. If broadcast fails,
+      // rollback restores the spent inputs. This eliminates the pending accumulation.
       let phase1: { tx: Transaction; walletOuts: number[]; result: T; snapshots: UTXO[] } | null = null;
       try {
         phase1 = await this.withSpendLock(async () => {
-          const picked = this.pickWalletUtxos(minSats);
+          const picked = this.pickWalletUtxos(minSats, pickPrefer);
           if (!picked) throw new Error(`NO_FUNDING:${minSats}`);
           const snapshots = picked.utxos.map(u => ({ ...u }));
           const { tx, walletOuts, result } = await build(picked);
@@ -379,12 +623,16 @@ export class DispatchManager {
       } catch (err: any) {
         lastErr = err;
         if (String(err?.message || '').startsWith('NO_FUNDING')) {
-          // Wallet is transiently exhausted (other in-flight TXs). Wait and retry.
+          // Wait briefly for in-flight broadcasts to release change UTXOs.
           if (attempt < MAX_ATTEMPTS - 1) {
-            await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+            await new Promise(r => setTimeout(r, 500));
             continue;
           }
-          throw new Error(`No funding available (need ${minSats} sats, have ${this.dispatchWallet.balance})`);
+          const spendable = this.dispatchWallet.spendableBalance;
+          const utxoCount = this.dispatchWallet.getUtxos().length;
+          throw new Error(
+            `No funding available (need ${minSats}, spendable ${spendable} in ${utxoCount} UTXOs)`
+          );
         }
         throw err;
       }
@@ -396,34 +644,73 @@ export class DispatchManager {
       try {
         const txid = await this.network.broadcast(tx);
 
-        // Phase 3: add change UTXO AFTER successful broadcast
-        if (walletOuts.length > 0) {
-          await this.withSpendLock(async () => {
-            const p2pkHex = this.dispatchWallet.p2pkLockingScript().toHex();
-            for (const idx of walletOuts) {
-              const out = tx.outputs[idx];
-              if (out && out.satoshis && out.satoshis > 0) {
-                this.dispatchWallet.addUtxo({
-                  txid, vout: idx, satoshis: out.satoshis,
-                  script: p2pkHex, sourceTransaction: tx,
-                });
-              }
+        // Phase 3: add change output as CONFIRMED.
+        const beforeCount = this.dispatchWallet.getUtxos().length;
+        await this.withSpendLock(async () => {
+          const p2pkhHex = this.dispatchWallet.p2pkhLockingScript().toHex();
+          for (const idx of walletOuts) {
+            const out = tx.outputs[idx];
+            if (out && out.satoshis && out.satoshis > 0) {
+              const outScriptHex = out.lockingScript?.toHex() ?? p2pkhHex;
+              this.dispatchWallet.addUtxo({
+                txid, vout: idx, satoshis: out.satoshis,
+                script: outScriptHex, sourceTransaction: tx,
+              });
+            } else {
+              // CHANGE OUTPUT IS MISSING OR ZERO — this is the leak!
+              console.log(`[LEAK] phase3 walletOuts[${idx}] has no output or 0 sats! outputs.length=${tx.outputs.length} idx=${idx} sats=${out?.satoshis}`);
             }
-          });
+          }
+        });
+        const afterCount = this.dispatchWallet.getUtxos().length;
+        if (afterCount <= beforeCount) {
+          console.log(`[LEAK] phase3 did NOT increase UTXO count! before=${beforeCount} after=${afterCount} walletOuts=${JSON.stringify(walletOuts)}`);
         }
+
+        this._recentWalletTxs.set(txid, {
+          broadcastAt: Date.now(),
+          walletOuts: walletOuts.slice(),
+        });
 
         return { tx, txid, result };
       } catch (err: any) {
         lastErr = err;
         const errMsg = String(err?.message || '');
-        const isUtxoSpecific = /failed to validate|missing|unknown.*input|previous|parent/i.test(errMsg);
-        if (isUtxoSpecific) {
-          const now = Date.now();
+        this._broadcastErrCount = (this._broadcastErrCount ?? 0) + 1;
+        if (this._broadcastErrCount <= 20 || this._broadcastErrCount % 50 === 0) {
+          console.log(`[broadcast-err #${this._broadcastErrCount}] txid=${phase1?.tx?.id('hex')?.slice(0,16)} err=${errMsg.slice(0,150)}`);
+        }
+
+        // MEMPOOL_CONFLICT means a PRIOR broadcast already spent this input.
+        // Mark it as mempool-conflict (won't be picked again until next block).
+        // Walk the spending chain to find the current TIP.
+        if (errMsg.startsWith('MEMPOOL_CONFLICT')) {
           for (const snap of snapshots) {
-            this._failedUtxos.set(`${snap.txid}:${snap.vout}`, now);
+            this._mempoolConflictUtxos.add(`${snap.txid}:${snap.vout}`);
+            this._walkAndRecoverTip(snap.txid, snap.vout).catch(() => {});
+          }
+          throw new Error(`Input already spent in mempool`);
+        }
+
+        // "Failed to validate" often means the parent TX didn't propagate to all nodes.
+        // RE-BROADCAST the parent TX before rolling back — this ensures all nodes see it.
+        const isValidationFail = /failed to validate|missing|unknown.*input|previous|parent/i.test(errMsg);
+        if (isValidationFail) {
+          // Re-broadcast each input's source TX to all Arcade endpoints (fire-and-forget)
+          for (const snap of snapshots) {
+            if (snap.sourceTransaction) {
+              try {
+                const parentEf = snap.sourceTransaction.toHexEF();
+                const parentBody = Buffer.from(parentEf, 'hex');
+                for (const ep of ['https://arcade-eu-1.bsvb.tech', 'https://arcade-ttn-us-1.bsvb.tech', 'https://arcade-us-1.bsvb.tech']) {
+                  fetch(`${ep}/tx`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: parentBody }).catch(() => {});
+                }
+              } catch {}
+            }
+            this._failedUtxos.set(`${snap.txid}:${snap.vout}`, Date.now());
           }
         }
-        // Rollback: restore spent UTXOs (no optimistic change to remove)
+        // Rollback: restore spent inputs
         await this.withSpendLock(async () => {
           for (const snap of snapshots) {
             this.dispatchWallet.addUtxo(snap);
@@ -442,14 +729,14 @@ export class DispatchManager {
   async fanOutIfNeeded(threshold = 500000, numOutputs = 50, satsPerOutput = 300000): Promise<void> {
     if (this.network.getNetwork() === 'regtest') return;
 
-    const utxos = this.dispatchWallet.getUtxos();
+    // Only consider P2PKH UTXOs (Teranode rejects P2PK)
+    const utxos = this.dispatchWallet.getUtxos().filter(u => u.script?.startsWith('76a914'));
     const big = utxos.filter(u => u.satoshis >= threshold);
     if (big.length === 0) return;
 
-    // Count how many small UTXOs we already have — if plenty, skip
     const smallEnough = utxos.filter(u => u.satoshis >= satsPerOutput && u.satoshis < threshold);
     if (smallEnough.length >= numOutputs) {
-      console.log(`[fanout] Skipping — already have ${smallEnough.length} suitable UTXOs`);
+      console.log(`[fanout] Skipping — already have ${smallEnough.length} suitable P2PKH UTXOs`);
       return;
     }
 
@@ -464,23 +751,32 @@ export class DispatchManager {
 
     try {
       await this.walletTxWithRollback(async (picked) => {
-        const tx = new Transaction();
-        tx.version = 2;
-        for (let i = 0; i < picked.utxos.length; i++) {
-          tx.addInput({
-            sourceTransaction: picked.utxos[i].sourceTransaction,
-            sourceOutputIndex: picked.utxos[i].vout,
-            unlockingScriptTemplate: picked.unlockTemplates[i],
-          });
-        }
-        const lockScript = this.dispatchWallet.p2pkLockingScript();
-        for (let i = 0; i < numOutputs; i++) {
-          tx.addOutput({ lockingScript: lockScript, satoshis: satsPerOutput });
-        }
-        tx.addOutput({ lockingScript: lockScript, change: true });
-        await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-        await tx.sign();
-        // walletOuts = all N fan-out outputs + change
+        const lockScript = this.dispatchWallet.p2pkhLockingScript();
+        // Two-pass: build, measure, set explicit change
+        const buildAndSign = async (changeSats: number) => {
+          const tx = new Transaction();
+          tx.version = 2;
+          for (let i = 0; i < picked.utxos.length; i++) {
+            tx.addInput({
+              sourceTransaction: picked.utxos[i].sourceTransaction,
+              sourceOutputIndex: picked.utxos[i].vout,
+              unlockingScriptTemplate: picked.unlockTemplates[i],
+            });
+          }
+          for (let i = 0; i < numOutputs; i++) {
+            tx.addOutput({ lockingScript: lockScript, satoshis: satsPerOutput });
+          }
+          tx.addOutput({ lockingScript: lockScript, satoshis: changeSats });
+          await tx.sign();
+          return tx;
+        };
+        let changeSats = picked.totalSats - (numOutputs * satsPerOutput) - 1000;
+        if (changeSats < 1) throw new Error(`Fanout: insufficient funds`);
+        let tx = await buildAndSign(changeSats);
+        const fee = Math.ceil(tx.toHex().length / 2 * 150 / 1000) + 50;
+        changeSats = picked.totalSats - (numOutputs * satsPerOutput) - fee;
+        if (changeSats < 1) throw new Error(`Fanout: fee exceeds change`);
+        tx = await buildAndSign(changeSats);
         const outs = Array.from({ length: numOutputs + 1 }, (_, i) => i);
         return { tx, walletOuts: outs, result: null };
       }, targetTotal);
@@ -507,56 +803,280 @@ export class DispatchManager {
 
       const known = new Set(this.dispatchWallet.getUtxos().map(u => `${u.txid}:${u.vout}`));
 
-      // One-time bootstrap: if wallet is empty (no persisted UTXOs), scan WoC for P2PK UTXOs
-      if (this.dispatchWallet.getUtxos().length === 0) {
-        console.log(`[dispatch] No persisted UTXOs — bootstrapping from WoC...`);
-        const p2pkScript = this.dispatchWallet.p2pkLockingScript().toHex();
-        const p2pkUtxos = await this.network.fetchScriptUtxos?.(p2pkScript) ?? [];
-        for (const u of p2pkUtxos) {
-          try {
-            const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
-            if (!resp.ok) continue;
-            const sourceTx = Transaction.fromHex(await resp.text());
-            this.dispatchWallet.addUtxo({
-              txid: u.txid, vout: u.vout, satoshis: u.satoshis,
-              script: p2pkScript, sourceTransaction: sourceTx,
-            });
-            known.add(`${u.txid}:${u.vout}`);
-          } catch { /* skip */ }
-        }
-        if (p2pkUtxos.length > 0) {
-          console.log(`[dispatch] Bootstrapped ${p2pkUtxos.length} P2PK UTXOs from WoC`);
-        }
-      }
+      // NOTE: We no longer bootstrap P2PK UTXOs on startup.
+      // Teranode has tightened standardness policy and rejects TXs spending P2PK
+      // outputs. We leave any existing P2PK UTXOs on chain as dust and operate
+      // entirely from P2PKH. Any deposits to this address should be P2PKH.
 
-      // Check for new P2PKH deposits not already in our UTXO set
+      // Check for new P2PKH deposits not already in our UTXO set.
+      // Verify via Arcade /tx/{txid} (no rate limits, closest to Teranode).
+      // Arcade returns txStatus for real TXs, "Transaction not found" for phantoms.
       const p2pkhUtxos = await this.network.fetchUtxos(this.dispatchWallet.address);
       let newDeposits = 0;
       let newSats = 0;
+      let skippedPhantom = 0;
+      // Batch: group UTXOs by txid to avoid duplicate TX hex fetches
+      const byTxid = new Map<string, Array<typeof p2pkhUtxos[0]>>();
       for (const u of p2pkhUtxos) {
         if (known.has(`${u.txid}:${u.vout}`)) continue;
+        if (this._mempoolConflictUtxos.has(`${u.txid}:${u.vout}`)) continue;
+        if (!byTxid.has(u.txid)) byTxid.set(u.txid, []);
+        byTxid.get(u.txid)!.push(u);
+      }
+
+      // STEP 1: Verify each parent TX exists on Teranode via Arcade (no rate limits).
+      // WoC returns UTXOs for TXs its node saw, but Teranode may never have seen them.
+      // Only proceed with UTXOs whose parent TX is confirmed on Arcade.
+      const VERIFY_BATCH = 20;
+      const txidList = [...byTxid.keys()];
+      const verifiedTxids = new Set<string>();
+      for (let i = 0; i < txidList.length; i += VERIFY_BATCH) {
+        const batch = txidList.slice(i, i + VERIFY_BATCH);
+        const results = await Promise.allSettled(
+          batch.map(async (txid) => {
+            try {
+              const r = await fetch(`https://arcade-eu-1.bsvb.tech/tx/${txid}`, { signal: AbortSignal.timeout(5000) });
+              if (!r.ok) return { txid, exists: false };
+              const j: any = await r.json();
+              // Only accept if Arcade has it with a real status (not error/not found)
+              const isReal = j.txStatus === 'SEEN_ON_NETWORK' || j.txStatus === 'MINED'
+                || j.txStatus === 'ANNOUNCED_TO_NETWORK' || j.txStatus === 'STORED';
+              if (j.error || !isReal) return { txid, exists: false };
+              return { txid, exists: true };
+            } catch { return { txid, exists: false }; }
+          })
+        );
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value.exists) {
+            verifiedTxids.add(r.value.txid);
+          }
+        }
+      }
+      const phantomTxids = txidList.length - verifiedTxids.size;
+      if (phantomTxids > 0) {
+        console.log(`[dispatch] Arcade verification: ${verifiedTxids.size} real, ${phantomTxids} phantom TXs skipped`);
+      }
+
+      // STEP 2: Fetch source TX hex only for verified TXs (from WoC, rate-limited)
+      const FETCH_BATCH = 5;
+      const verifiedList = [...verifiedTxids];
+      for (let i = 0; i < verifiedList.length; i += FETCH_BATCH) {
+        const batch = verifiedList.slice(i, i + FETCH_BATCH);
+        const results = await Promise.allSettled(
+          batch.map(async (txid) => {
+            try {
+              const r = await fetch(`${wocBase}/tx/${txid}/hex`, { signal: AbortSignal.timeout(5000) });
+              if (!r.ok) return { txid, ok: false };
+              return { txid, ok: true, txHex: await r.text() };
+            } catch { return { txid, ok: false }; }
+          })
+        );
+        for (const r of results) {
+          if (r.status !== 'fulfilled' || !r.value.ok) continue;
+          const { txid, txHex } = r.value as { txid: string; ok: true; txHex: string };
+          try {
+            const sourceTx = Transaction.fromHex(txHex!);
+            for (const u of byTxid.get(txid) || []) {
+              const actualScript = sourceTx.outputs[u.vout]?.lockingScript?.toHex();
+              if (!actualScript) continue;
+              const before = this.dispatchWallet.getUtxos().length;
+              this.dispatchWallet.addUtxo({
+                txid: u.txid, vout: u.vout, satoshis: u.satoshis,
+                script: actualScript, sourceTransaction: sourceTx,
+              });
+              if (this.dispatchWallet.getUtxos().length > before) {
+                newDeposits++;
+                newSats += u.satoshis;
+                known.add(`${u.txid}:${u.vout}`);
+              }
+            }
+          } catch {}
+        }
+      }
+      if (newDeposits > 0 || skippedPhantom > 0) {
+        console.log(`[dispatch] New deposits: ${newDeposits} UTXOs (${newSats} sats), skipped ${skippedPhantom} phantom`);
+      }
+
+      // Cache chain balance from WoC query — this is stable (doesn't flicker like memory balance)
+      const chainTotal = p2pkhUtxos.reduce((s: number, u: any) => s + (u.satoshis || u.value || 0), 0);
+      if (chainTotal > 0) this.lastChainBalanceSats = chainTotal;
+      console.log(`[dispatch] Chain balance: ${this.lastChainBalanceSats} sats (${(this.lastChainBalanceSats/1e8).toFixed(4)} BSV), mem: ${this.dispatchWallet.getUtxos().length} UTXOs`);
+    } catch (err: any) {
+      console.log(`[dispatch] Deposit scan failed: ${err.message}`);
+    }
+  }
+
+  /** Verify recently-broadcast wallet TXs actually landed on chain.
+   *  For each TX we broadcast ≥ `minAgeMs` ago: query WoC by txid. If 404, the TX
+   *  was evicted/dropped. Remove its change outputs (they're ghosts). If found,
+   *  mark verified. Drops verified entries older than 30 min.
+   *
+   *  This is SURGICAL — it only removes UTXOs we KNOW are ghosts (parent TX missing),
+   *  never false-positives like the WoC-wide prune did. */
+  async verifyWalletTxs(opts: { minAgeMs?: number; maxPerRun?: number } = {}): Promise<{ checked: number; promoted: number; ghosts: number; ghostSats: number }> {
+    if (this.network.getNetwork() === 'regtest') {
+      // Regtest: nothing to verify, but promote all pending UTXOs immediately
+      let promoted = 0;
+      for (const u of this.dispatchWallet.getUtxos()) {
+        if (u.pending) { this.dispatchWallet.clearPending(u.txid, u.vout); promoted++; }
+      }
+      return { checked: 0, promoted, ghosts: 0, ghostSats: 0 };
+    }
+    const minAgeMs = opts.minAgeMs ?? 2_000;
+    const maxPerRun = opts.maxPerRun ?? 40;
+
+    const now = Date.now();
+    const candidates: Array<[string, { broadcastAt: number; walletOuts: number[]; verified?: boolean }]> = [];
+    for (const entry of this._recentWalletTxs.entries()) {
+      const [txid, rec] = entry;
+      if (rec.verified) {
+        if (now - rec.broadcastAt > 30 * 60 * 1000) {
+          this._recentWalletTxs.delete(txid);
+        }
+        continue;
+      }
+      if (now - rec.broadcastAt >= minAgeMs) {
+        candidates.push(entry);
+      }
+    }
+    candidates.sort((a, b) => a[1].broadcastAt - b[1].broadcastAt);
+
+    let checked = 0, promoted = 0, ghosts = 0, ghostSats = 0;
+    for (const [txid, rec] of candidates.slice(0, maxPerRun)) {
+      checked++;
+      const age = now - rec.broadcastAt;
+      try {
+        // Use Arcade for existence check (no rate limits, closest to Teranode).
+        const resp = await fetch(`https://arcade-eu-1.bsvb.tech/tx/${txid}`, { signal: AbortSignal.timeout(5000) });
+        if (resp.ok) {
+          const j: any = await resp.json();
+          // Only SEEN_ON_NETWORK, MINED, ANNOUNCED, STORED count as real.
+          // REJECTED is NOT valid — that's a ghost!
+          const isReal = j.txStatus === 'SEEN_ON_NETWORK' || j.txStatus === 'MINED'
+            || j.txStatus === 'ANNOUNCED_TO_NETWORK' || j.txStatus === 'STORED';
+          if (isReal) {
+            rec.verified = true;
+            promoted++;
+            continue;
+          }
+          // TX is REJECTED or not found — it's a ghost. Remove after age threshold.
+          if (age >= 10_000) {
+            await this.withSpendLock(async () => {
+              for (const vout of rec.walletOuts) {
+                const utxo = this.dispatchWallet.getUtxos().find(u => u.txid === txid && u.vout === vout);
+                if (utxo) {
+                  ghostSats += utxo.satoshis;
+                  this.dispatchWallet.spendUtxo(txid, vout);
+                  ghosts++;
+                }
+              }
+            });
+            this._recentWalletTxs.delete(txid);
+            console.log(`[verify] GHOST: ${txid.slice(0,16)} not in Arcade after ${Math.round(age/1000)}s`);
+          }
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 20));
+    }
+    return { checked, promoted, ghosts, ghostSats };
+  }
+
+  /** Prune in-memory UTXOs that the chain says are already spent.
+   *  Only REMOVES — never adds. Safe to run periodically because it won't re-add
+   *  ghosts that WoC reports as "unspent" but which ARC is currently spending.
+   *  Preserves pending UTXOs (in-flight broadcasts) and recently-added confirmed UTXOs. */
+  async pruneGhosts(opts: { minAgeMs?: number } = {}): Promise<{ removed: number; totalSats: number }> {
+    if (this.network.getNetwork() === 'regtest') {
+      return { removed: 0, totalSats: this.dispatchWallet.balance };
+    }
+
+    const p2pkScript = this.dispatchWallet.p2pkLockingScript().toHex();
+    const p2pkUnspent = await this.network.fetchScriptUtxos?.(p2pkScript) ?? [];
+    const p2pkhUnspent = await this.network.fetchUtxos(this.dispatchWallet.address);
+
+    const chainUnspent = new Set<string>();
+    for (const u of p2pkUnspent) chainUnspent.add(`${u.txid}:${u.vout}`);
+    for (const u of p2pkhUnspent) chainUnspent.add(`${u.txid}:${u.vout}`);
+
+    return await this.withSpendLock(async () => {
+      const current = this.dispatchWallet.getUtxos();
+      let removed = 0;
+      for (const u of current) {
+        if (u.pending) continue;
+        if (!chainUnspent.has(`${u.txid}:${u.vout}`)) {
+          this.dispatchWallet.spendUtxo(u.txid, u.vout);
+          removed++;
+        }
+      }
+      const totalSats = this.dispatchWallet.balance;
+      console.log(`[prune] chain=${chainUnspent.size}, removed=${removed}, mem=${this.dispatchWallet.getUtxos().length}, balance=${(totalSats/1e8).toFixed(4)} BSV`);
+      return { removed, totalSats };
+    });
+  }
+
+  /** Full reconcile — removes ghosts AND adds chain UTXOs we don't know about.
+   *  Use for one-shot manual sync. Do NOT run periodically (WoC lag causes ghost re-adds). */
+  async reconcileFromChain(): Promise<{ added: number; removed: number; totalSats: number }> {
+    if (this.network.getNetwork() === 'regtest') {
+      return { added: 0, removed: 0, totalSats: this.dispatchWallet.balance };
+    }
+    const wocBase = this.network.getNetwork() === 'mainnet'
+      ? 'https://api.whatsonchain.com/v1/bsv/main'
+      : 'https://api.whatsonchain.com/v1/bsv/test';
+
+    const p2pkScript = this.dispatchWallet.p2pkLockingScript().toHex();
+    const p2pkUnspent = await this.network.fetchScriptUtxos?.(p2pkScript) ?? [];
+    const p2pkhUnspent = await this.network.fetchUtxos(this.dispatchWallet.address);
+
+    const chainSet = new Set<string>();
+    for (const u of p2pkUnspent) chainSet.add(`${u.txid}:${u.vout}`);
+    for (const u of p2pkhUnspent) chainSet.add(`${u.txid}:${u.vout}`);
+
+    return await this.withSpendLock(async () => {
+      const current = this.dispatchWallet.getUtxos();
+      let removed = 0;
+      for (const u of current) {
+        if (u.pending) continue;
+        if (!chainSet.has(`${u.txid}:${u.vout}`)) {
+          this.dispatchWallet.spendUtxo(u.txid, u.vout);
+          removed++;
+        }
+      }
+      const have = new Set(this.dispatchWallet.getUtxos().map(u => `${u.txid}:${u.vout}`));
+      let added = 0;
+      for (const u of p2pkUnspent) {
+        const key = `${u.txid}:${u.vout}`;
+        if (have.has(key)) continue;
         try {
           const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
           if (!resp.ok) continue;
-          const txHex = await resp.text();
-          const sourceTx = Transaction.fromHex(txHex);
+          const sourceTx = Transaction.fromHex(await resp.text());
+          this.dispatchWallet.addUtxo({
+            txid: u.txid, vout: u.vout, satoshis: u.satoshis,
+            script: p2pkScript, sourceTransaction: sourceTx,
+          });
+          added++;
+        } catch { /* skip */ }
+      }
+      for (const u of p2pkhUnspent) {
+        const key = `${u.txid}:${u.vout}`;
+        if (have.has(key)) continue;
+        try {
+          const resp = await fetch(`${wocBase}/tx/${u.txid}/hex`);
+          if (!resp.ok) continue;
+          const sourceTx = Transaction.fromHex(await resp.text());
           const actualScript = sourceTx.outputs[u.vout].lockingScript!.toHex();
           this.dispatchWallet.addUtxo({
             txid: u.txid, vout: u.vout, satoshis: u.satoshis,
             script: actualScript, sourceTransaction: sourceTx,
           });
-          newDeposits++;
-          newSats += u.satoshis;
+          added++;
         } catch { /* skip */ }
       }
-      if (newDeposits > 0) {
-        console.log(`[dispatch] New deposits: ${newDeposits} UTXOs (${newSats} sats)`);
-      }
-
-      console.log(`[dispatch] Wallet: ${this.dispatchWallet.balance} sats, ${this.dispatchWallet.getUtxos().length} UTXOs`);
-    } catch (err: any) {
-      console.log(`[dispatch] Deposit scan failed: ${err.message}`);
-    }
+      const totalSats = this.dispatchWallet.balance;
+      console.log(`[reconcile] chain=${chainSet.size}, before=${current.length}, removed=${removed}, added=${added}, after=${this.dispatchWallet.getUtxos().length}, totalSats=${totalSats}`);
+      return { added, removed, totalSats };
+    });
   }
 
   /** Persist the wallet's current UTXO set to disk (debounced — called on every add/spend) */
@@ -692,19 +1212,24 @@ export class DispatchManager {
    * Create N work packages for an agent in parallel.
    * The wallet broadcasts run concurrently (via walletTxWithRollback's parallel pattern).
    */
+  /**
+   * GENESIS + FAN-OUT: creates 1 covenant (at vout 0) + N-1 fan-out P2PKH outputs.
+   * The covenant script hardcodes vout=0, so only 1 covenant per TX.
+   * But the fan-out outputs replenish the UTXO pool — every genesis TX feeds N-1 more.
+   * Returns 1 work package (the batch concept feeds the POOL, not the agent).
+   */
   async createWorkBatch(agentId: string, count: number): Promise<{ works?: WorkPackage[]; error?: string }> {
-    const agent = this.agents.get(agentId);
-    if (!agent) return { error: 'Agent not found' };
-    if (this.startTime === 0) this.startTime = performance.now();
-
-    const promises: Promise<{ work?: WorkPackage; error?: string }>[] = [];
-    for (let i = 0; i < count; i++) {
-      promises.push(this.createWorkPackageInternal(agentId, true));
-    }
+    // Create work packages in parallel — Phase 1 (pick+sign) is serialized by
+    // spend lock, but Phase 2 (broadcast) runs concurrently. This is much faster
+    // than sequential creation.
+    const promises = Array.from({ length: count }, () =>
+      this.createWorkPackageInternal(agentId, true).catch(e => ({ error: e.message } as { work?: WorkPackage; error: string }))
+    );
     const results = await Promise.all(promises);
     const works = results.filter(r => r.work).map(r => r.work!);
     if (works.length === 0) {
-      return { error: results[0]?.error || 'No work created' };
+      const firstErr = results.find(r => r.error)?.error || 'No work created';
+      return { error: firstErr };
     }
     return { works };
   }
@@ -733,6 +1258,7 @@ export class DispatchManager {
         compiledAsm: ext.compiledAsm,
         genesisTxHex: ext.genesisTxHex,
         genesisTxid: ext.genesisTxid,
+        genesisVout: 0,
         numSteps: ext.receptor.atoms.length,
         status: 'assigned',
         assignedAt: new Date().toISOString(),
@@ -791,21 +1317,35 @@ export class DispatchManager {
     // Create genesis TX — parallel-safe: pick+sign under lock, broadcast outside
     try {
       const { tx: genesisTx, txid: genesisTxid } = await this.walletTxWithRollback(async (picked) => {
-        const tx = new Transaction();
-        tx.version = 2;
-        for (let i = 0; i < picked.utxos.length; i++) {
-          tx.addInput({
-            sourceTransaction: picked.utxos[i].sourceTransaction,
-            sourceOutputIndex: picked.utxos[i].vout,
-            unlockingScriptTemplate: picked.unlockTemplates[i],
-          });
-        }
-        tx.addOutput({ lockingScript: buildChainLockScript(numAtoms, 0, compiledAsm), satoshis: 1 });
-        tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
-        await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-        await tx.sign();
+        // Two-pass build: first pass signs with a placeholder change, then we measure
+        // the actual signed size, compute fee at 150 sats/kB, update change, re-sign.
+        // Simple genesis: covenant at output 0, change at output 1.
+        // NO inline fan-out — it amplifies ghost UTXOs (each failed genesis
+        // creates 5+ ghosts instead of 1). Pool replenished by fanOutVaried.
+        const buildAndSign = async (changeSats: number) => {
+          const tx = new Transaction();
+          tx.version = 2;
+          for (let i = 0; i < picked.utxos.length; i++) {
+            tx.addInput({
+              sourceTransaction: picked.utxos[i].sourceTransaction,
+              sourceOutputIndex: picked.utxos[i].vout,
+              unlockingScriptTemplate: picked.unlockTemplates[i],
+            });
+          }
+          tx.addOutput({ lockingScript: buildChainLockScript(numAtoms, 0, compiledAsm), satoshis: 1 });
+          tx.addOutput({ lockingScript: this.dispatchWallet.p2pkhLockingScript(), satoshis: changeSats });
+          await tx.sign();
+          return tx;
+        };
+        let changeSats = picked.totalSats - 1 - 1000;
+        if (changeSats < 1) throw new Error(`Genesis: insufficient funds`);
+        let tx = await buildAndSign(changeSats);
+        const fee = Math.ceil(tx.toHex().length / 2 * 150 / 1000) + 50;
+        changeSats = picked.totalSats - 1 - fee;
+        if (changeSats < 1) throw new Error(`Genesis: fee exceeds funds`);
+        tx = await buildAndSign(changeSats);
         return { tx, walletOuts: [1], result: null };
-      }, 500);
+      }, 5000, 'median'); // Genesis: pick median UTXO (prevents deep ancestor chains)
       await this.network.mine(1);
 
       const workId = Math.random().toString(36).slice(2, 10);
@@ -817,6 +1357,7 @@ export class DispatchManager {
         compiledAsm,
         genesisTxHex: genesisTx.toHex(),
         genesisTxid,
+        genesisVout: 0, // single genesis: covenant is always at output 0
         numSteps: molReceptor.atoms.length,
         status: 'assigned',
         assignedAt: new Date().toISOString(),
@@ -857,12 +1398,16 @@ export class DispatchManager {
     agent.currentMoleculeId = null;
     agent.lastSeen = new Date().toISOString();
 
-    // Spot-check: re-execute and verify the score
-    const verified = this.spotCheckScore(work);
-    if (!verified) {
-      console.log(`[dispatch] SPOT CHECK FAILED for ${agent.name} on ${workId}! Score mismatch.`);
-      agent.trustLevel = Math.max(0, agent.trustLevel - 1);
-      this.pushEvent({ type: 'spot_check_fail', agentName: agent.name, agentId, moleculeId: work.molecule.id });
+    // Spot-check: re-execute and verify the score.
+    // Skip if score is 999999 — that's the browser sentinel for "chain broadcast failed",
+    // not an actual energy calculation. Spot-checking it would always fail.
+    if (finalScore !== 999999) {
+      const verified = this.spotCheckScore(work);
+      if (!verified) {
+        console.log(`[dispatch] SPOT CHECK FAILED for ${agent.name} on ${workId}! Score mismatch.`);
+        agent.trustLevel = Math.max(0, agent.trustLevel - 1);
+        this.pushEvent({ type: 'spot_check_fail', agentName: agent.name, agentId, moleculeId: work.molecule.id });
+      }
     }
 
     // Fire-and-forget reward — walletTxWithRollback handles failure rollback internally
@@ -1000,34 +1545,56 @@ export class DispatchManager {
     agentPubkey: string, count: number, satsEach: number,
   ): Promise<FeePackage['utxos']> {
     // Build + sign under spend lock
-    const totalNeeded = count * satsEach + 500;
+    // Need: N agent outputs + miner fee + minimum change.
+    // P2PKH output ~35 bytes; P2PKH input ~150 bytes; overhead ~10 bytes.
+    // Arcade requires 100+ sats/kB — use 150 to be safe.
+    const estFeeBytes = 35 * (count + 1) + 160;
+    const estFee = Math.ceil(estFeeBytes * 150 / 1000) + 100;
+    const totalNeeded = count * satsEach + estFee + 1;
 
+    // Use P2PKH for agent fee outputs — Teranode rejects bare P2PK now.
+    // Agent derives hash160(pubkey) client-side and can still spend via
+    // standard P2PKH unlock (sig + pubkey push).
     const agentPubkeyBytes = Buffer.from(agentPubkey, 'hex');
+    const pubkeyHash = Hash.hash160(Array.from(agentPubkeyBytes)) as number[];
     const agentLockScript = new Script([
-      { op: agentPubkeyBytes.length, data: [...agentPubkeyBytes] },
+      { op: 0x76 }, // OP_DUP
+      { op: 0xa9 }, // OP_HASH160
+      { op: pubkeyHash.length, data: pubkeyHash },
+      { op: 0x88 }, // OP_EQUALVERIFY
       { op: 0xac }, // OP_CHECKSIG
     ]).toHex();
     const agentLock = Script.fromHex(agentLockScript);
 
     // Parallel-safe: pick+sign under lock, broadcast outside
     const { tx: feeTx, txid: feeTxid } = await this.walletTxWithRollback(async (picked) => {
-      const tx = new Transaction();
-      tx.version = 2;
-      for (let i = 0; i < picked.utxos.length; i++) {
-        tx.addInput({
-          sourceTransaction: picked.utxos[i].sourceTransaction,
-          sourceOutputIndex: picked.utxos[i].vout,
-          unlockingScriptTemplate: picked.unlockTemplates[i],
-        });
-      }
-      for (let i = 0; i < count; i++) {
-        tx.addOutput({ lockingScript: agentLock, satoshis: satsEach });
-      }
-      tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
-      await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-      await tx.sign();
+      const buildAndSign = async (changeSats: number) => {
+        const tx = new Transaction();
+        tx.version = 2;
+        for (let i = 0; i < picked.utxos.length; i++) {
+          tx.addInput({
+            sourceTransaction: picked.utxos[i].sourceTransaction,
+            sourceOutputIndex: picked.utxos[i].vout,
+            unlockingScriptTemplate: picked.unlockTemplates[i],
+          });
+        }
+        for (let i = 0; i < count; i++) {
+          tx.addOutput({ lockingScript: agentLock, satoshis: satsEach });
+        }
+        tx.addOutput({ lockingScript: this.dispatchWallet.p2pkhLockingScript(), satoshis: changeSats });
+        await tx.sign();
+        return tx;
+      };
+      let changeSats = picked.totalSats - (count * satsEach) - 500;
+      if (changeSats < 1) throw new Error(`Fee TX: insufficient funds`);
+      let tx = await buildAndSign(changeSats);
+      const actualSize = tx.toHex().length / 2;
+      const fee = Math.ceil(actualSize * 150 / 1000) + 10;
+      changeSats = picked.totalSats - (count * satsEach) - fee;
+      if (changeSats < 1) throw new Error(`Fee TX: fee ${fee} exceeds change`);
+      tx = await buildAndSign(changeSats);
       return { tx, walletOuts: [count], result: null };
-    }, totalNeeded);
+    }, totalNeeded, 'largest'); // Fee TX: pick largest UTXO (more change for future use)
     await this.network.mine(1);
 
     const result: FeePackage['utxos'] = [];
@@ -1070,21 +1637,31 @@ export class DispatchManager {
 
     try {
       const { txid } = await this.walletTxWithRollback(async (picked) => {
-        const tx = new Transaction();
-        tx.version = 2;
-        for (let i = 0; i < picked.utxos.length; i++) {
-          tx.addInput({
-            sourceTransaction: picked.utxos[i].sourceTransaction,
-            sourceOutputIndex: picked.utxos[i].vout,
-            unlockingScriptTemplate: picked.unlockTemplates[i],
-          });
-        }
-        tx.addOutput({ lockingScript: agentLockScript, satoshis: rewardSats });
-        tx.addOutput({ lockingScript: this.dispatchWallet.p2pkLockingScript(), change: true });
-        await tx.fee(new SatoshisPerKilobyte(FEE_RATE_SATS_PER_KB));
-        await tx.sign();
+        const buildAndSign = async (changeSats: number) => {
+          const tx = new Transaction();
+          tx.version = 2;
+          for (let i = 0; i < picked.utxos.length; i++) {
+            tx.addInput({
+              sourceTransaction: picked.utxos[i].sourceTransaction,
+              sourceOutputIndex: picked.utxos[i].vout,
+              unlockingScriptTemplate: picked.unlockTemplates[i],
+            });
+          }
+          tx.addOutput({ lockingScript: agentLockScript, satoshis: rewardSats });
+          tx.addOutput({ lockingScript: this.dispatchWallet.p2pkhLockingScript(), satoshis: changeSats });
+          await tx.sign();
+          return tx;
+        };
+        let changeSats = picked.totalSats - rewardSats - 500;
+        if (changeSats < 1) throw new Error(`Reward: insufficient funds`);
+        let tx = await buildAndSign(changeSats);
+        const actualSize = tx.toHex().length / 2;
+        const fee = Math.ceil(actualSize * 150 / 1000) + 10;
+        changeSats = picked.totalSats - rewardSats - fee;
+        if (changeSats < 1) throw new Error(`Reward: fee ${fee} exceeds change`);
+        tx = await buildAndSign(changeSats);
         return { tx, walletOuts: [1], result: null };
-      }, rewardSats + 200);
+      }, rewardSats + 501, 'smallest'); // Reward: pick smallest (preserve big for fees)
       await this.network.mine(1);
       agent.totalRewardsSats += rewardSats;
       console.log(`[dispatch] Paid ${rewardSats} sats to ${agent.name} → ${destination} (total: ${agent.totalRewardsSats} sats) txid=${txid}`);
@@ -1259,10 +1836,16 @@ export class DispatchManager {
       cumulativeFailed: this.persistedState.cumulativeFailed + sessionFailed,
       results: allResults,
       testedKeys,
-      utxos: this.dispatchWallet.getUtxos().map(u => ({
-        txid: u.txid, vout: u.vout, satoshis: u.satoshis, script: u.script,
-        sourceTxHex: u.sourceTransaction ? u.sourceTransaction.toHex() : '',
-      })).filter(u => u.sourceTxHex.length > 0),
+      // CRITICAL: filter out `pending` UTXOs — they're in-memory only.
+      // Pending means the parent TX broadcast hasn't confirmed yet. Persisting them
+      // would create ghost UTXOs on disk if the server crashes before broadcast confirms.
+      utxos: this.dispatchWallet.getUtxos()
+        .filter(u => !u.pending)
+        .map(u => ({
+          txid: u.txid, vout: u.vout, satoshis: u.satoshis, script: u.script,
+          sourceTxHex: u.sourceTransaction ? u.sourceTransaction.toHex() : '',
+        }))
+        .filter(u => u.sourceTxHex.length > 0),
     });
   }
 
@@ -1308,7 +1891,20 @@ export class DispatchManager {
 
     const elapsed = this.startTime > 0 ? performance.now() - this.startTime : 0;
 
-    const txsPerSecond = elapsed > 0 ? sessionTxs / (elapsed / 1000) : 0;
+    // Rolling 60-second TX rate (not session average)
+    const now = Date.now();
+    this._txSnapshots.push({ time: now, txs: totalTxs });
+    // Drop entries older than 60s
+    while (this._txSnapshots.length > 0 && now - this._txSnapshots[0].time > 60_000) {
+      this._txSnapshots.shift();
+    }
+    let txsPerSecond = 0;
+    if (this._txSnapshots.length >= 2) {
+      const oldest = this._txSnapshots[0];
+      const newest = this._txSnapshots[this._txSnapshots.length - 1];
+      const dt = (newest.time - oldest.time) / 1000;
+      if (dt > 0) txsPerSecond = (newest.txs - oldest.txs) / dt;
+    }
     const avgTxsPerMol = totalProcessed > 0 ? Math.round(totalTxs / totalProcessed) : 21;
 
     // Time remaining estimate based on current rate
@@ -1316,9 +1912,19 @@ export class DispatchManager {
     const etaMs = txsPerSecond > 0 ? (txsRemaining / txsPerSecond) * 1000 : 0;
     const timeRemainingMs = Math.max(0, this.MAX_RUN_MS - elapsed);
 
-    // Wallet balance = sum of persisted UTXOs. Simple and accurate.
-    const walletBalanceSats = this.dispatchWallet.balance;
+    // Wallet balance = sum of NON-pending UTXOs. Pending = optimistic change
+    // outputs from in-flight broadcasts that haven't confirmed yet. Showing them
+    // as "balance" is misleading and drifts up as they pile up.
+    // Show TOTAL balance (confirmed + pending). Pending is real money waiting
+    // for verify-tick to confirm the parent TX exists on chain.
+    // Use chain balance (from WoC scan) if available — it's accurate.
+    // Fall back to wallet memory balance if chain hasn't been scanned yet.
+    const walletBalanceSats = this.lastChainBalanceSats > 0
+      ? this.lastChainBalanceSats
+      : this.dispatchWallet.balance;
     const walletUtxoCount = this.dispatchWallet.getUtxos().length;
+    const pendingUtxoCount = this.dispatchWallet.pendingCount;
+    const pendingBalanceSats = this.dispatchWallet.pendingBalance;
 
     // Run status flags
     const targetReached = totalTxs >= this.TX_TARGET;
@@ -1347,6 +1953,9 @@ export class DispatchManager {
       maxRunMs: this.MAX_RUN_MS,
       walletBalanceSats,
       walletUtxoCount,
+      pendingUtxoCount,
+      pendingBalanceSats,
+      chainBalanceSats: this.lastChainBalanceSats,
       targetReached,
       timeExpired,
       fundsExhausted,

@@ -307,9 +307,11 @@ function showMolModal(jsonStrOrEl) {
         if (address) addrInput.value = address;
         // Wait for module script to run + BSV SDK to load (top-level await suspends module).
         // Keep polling until window.toggleBrowserAgent is defined, then click.
+        // BSV SDK loads async inside toggleBrowserAgent — we don't wait for it here
+        // because it can be slow and we want the rest of the dashboard to update.
         let waitedMs = 0;
         const poll = setInterval(() => {
-          if (typeof window.toggleBrowserAgent === 'function' && window.BSV) {
+          if (typeof window.toggleBrowserAgent === 'function') {
             clearInterval(poll);
             console.log('[autoStart] firing toggleBrowserAgent for', name);
             window.toggleBrowserAgent();
@@ -317,7 +319,7 @@ function showMolModal(jsonStrOrEl) {
             waitedMs += 250;
             if (waitedMs >= 30000) {
               clearInterval(poll);
-              console.warn('[autoStart] gave up after 30s — toggleBrowserAgent or BSV not ready');
+              console.warn('[autoStart] gave up after 30s — toggleBrowserAgent not ready');
             }
           }
         }, 250);
@@ -344,8 +346,14 @@ function showMolModal(jsonStrOrEl) {
           versionEl.textContent = 'v' + formatted + ' UTC';
         }
       } else if (d.version !== lastSeenVersion) {
-        console.log('[watchdog] Server version changed — reloading');
-        location.reload();
+        console.log('[watchdog] Server version changed — sweeping + reloading');
+        // Fire-and-forget sweep — DON'T await, just kick it off and reload immediately.
+        // The sweep broadcasts will complete in the background before the page fully unloads.
+        if (typeof window._sweepToDispatch === 'function') {
+          try { window._sweepToDispatch(); } catch {} // no await!
+        }
+        // Small delay to let the sweep fetch start, then reload
+        setTimeout(() => location.reload(), 500);
       }
     } catch {}
   }
@@ -360,21 +368,72 @@ function showMolModal(jsonStrOrEl) {
     checkVersion();
     setInterval(checkVersion, 10000);
   });
+
+  // ===== FALLBACK refresh — runs in this non-module script so it can NEVER be
+  //       blocked by a module-level hang (e.g. failed CDN imports).
+  //       Updates the core stats panels every 5s. The full refresh in the module
+  //       still runs at 2s when alive — this is purely a "module dead" safety net.
+  let _fbInFlight = false;
+  async function fallbackRefresh() {
+    if (_fbInFlight) return;
+    _fbInFlight = true;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 4000);
+      const r = await fetch('/api/dashboard-data', { signal: ctrl.signal, cache: 'no-store' });
+      clearTimeout(timer);
+      if (!r.ok) return;
+      const data = await r.json();
+      const s = data.stats || {};
+      // Update only the most critical fields — minimal DOM ops, no third-party deps
+      const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      set('agent-val', (s.activeAgents||0) + '/' + (s.totalAgents||0));
+      set('agent-sub', (s.activeAgents||0) + ' working');
+      set('proc-val', (s.processed||0).toString());
+      const totalTxs = s.totalTxs || 0;
+      set('tx-val', totalTxs.toLocaleString());
+      set('tx-sub', (s.txsPerSecond||0).toFixed(1) + ' tx/s');
+      // TX progress bar
+      const TARGET = s.txTarget || 1500000;
+      const pct = Math.min(100, totalTxs / TARGET * 100);
+      const fill = document.getElementById('target-fill');
+      if (fill) fill.style.width = pct.toFixed(2) + '%';
+      const txt = document.getElementById('target-text');
+      if (txt) txt.textContent = totalTxs.toLocaleString() + ' / ' + TARGET.toLocaleString();
+      // Rate display under progress bar
+      const rateEl = document.getElementById('target-rate');
+      if (rateEl) rateEl.textContent = (s.txsPerSecond||0).toFixed(1) + ' tx/s';
+      // Wallet balance display — use chain balance (stable)
+      const balEl = document.getElementById('wallet-balance');
+      if (balEl) balEl.textContent = (((s.chainBalanceSats||s.walletBalanceSats||0))/1e8).toFixed(4) + ' BSV';
+      // Agents table: DON'T update from fallback — let the module refresh handle it
+      // with full colors, trust badges, and status. Fallback only updates stats panels.
+    } catch {}
+    finally { _fbInFlight = false; }
+  }
+  window.addEventListener('load', () => {
+    fallbackRefresh();
+    setInterval(fallbackRefresh, 5000);
+  });
 })();
 </script>
 
 <script type="module">
 // Load @bsv/sdk from ESM CDN for in-browser chain building & signing.
-// Falls back gracefully: if CDN is unreachable, browser agent stays disabled.
+// CRITICAL: don't use top-level await here — if esm.sh is slow, the entire
+// dashboard module would block, freezing refresh() and the watchdog.
+// Load it as a non-blocking background promise; anything that needs BSV awaits _bsvReady.
 let BSV = null;
-try {
-  BSV = await import('https://esm.sh/@bsv/sdk@1.10.1');
-  window.__bsv = BSV;
-  window.BSV = BSV; // for autoStart watchdog
+const _bsvReady = import('https://esm.sh/@bsv/sdk@1.10.1').then(mod => {
+  BSV = mod;
+  window.__bsv = mod;
+  window.BSV = mod; // for autoStart watchdog
   console.log('[browser-agent] BSV SDK loaded');
-} catch (err) {
+  return mod;
+}).catch(err => {
   console.warn('[browser-agent] Failed to load @bsv/sdk from CDN:', err);
-}
+  return null;
+});
 
 const $=id=>document.getElementById(id);
 function fmt(ms){if(!ms)return'--';if(ms<1000)return ms.toFixed(0)+'ms';if(ms<60000)return(ms/1000).toFixed(1)+'s';return(ms/60000).toFixed(1)+'m'}
@@ -475,9 +534,19 @@ const nameColors=['#00ccff','#00ff88','#ffaa00','#ff6699','#aa88ff','#88ddff','#
 
 // ========== Dashboard Refresh ==========
 let _refreshInFlight = false;
+let _lastRefreshOk = Date.now();
+let _refreshInFlightSince = 0;
 async function refresh(){
+  // Stall recovery: if a refresh has been "in flight" for >8s, force-clear the flag.
+  // This handles the case where an unhandled error leaves the guard stuck.
+  if (_refreshInFlight && _refreshInFlightSince > 0 && (Date.now() - _refreshInFlightSince) > 8000) {
+    console.warn('[refresh] stalled in-flight for', Date.now() - _refreshInFlightSince, 'ms — force clearing');
+    _refreshInFlight = false;
+    _refreshInFlightSince = 0;
+  }
   if (_refreshInFlight) return; // prevent overlap
   _refreshInFlight = true;
+  _refreshInFlightSince = Date.now();
   try{
     // Single combined endpoint — 1 fetch instead of 5.
     // 5s timeout so stalled refreshes don't block subsequent ones.
@@ -530,8 +599,9 @@ async function refresh(){
     if (stats.moleculeCount) $('target-drugs-sub').textContent = stats.moleculeCount;
     if (stats.receptorCount) $('target-receptors-sub').textContent = stats.receptorCount;
 
-    // Wallet balance — update both the stats panel and the funding banner
-    const walBal = stats.walletBalanceSats || 0;
+    // Wallet balance — use chain balance (stable from WoC scan) not memory snapshot
+    // Memory balance flickers because UTXOs cycle through broadcasts in milliseconds.
+    const walBal = stats.chainBalanceSats || stats.walletBalanceSats || 0;
     const walEl = $('target-wallet');
     if (walBal < 5000) {
       walEl.textContent = walBal.toLocaleString() + ' sats';
@@ -612,8 +682,9 @@ async function refresh(){
       return '<tr style="cursor:pointer" onclick="showMolModal(this.dataset.mol)" data-mol="'+dataAttr+'"><td class="rank">#'+(i+1)+'</td><td>'+r.moleculeId+'</td><td style="color:#00ccff;font-size:9px">'+tgt+'</td><td class="'+cls+'">'+r.finalScore+'</td><td>'+res+'</td><td style="color:#888">'+(r.agentName||'')+'</td><td>'+r.chainSteps+' steps</td></tr>';
     }).join('');
 
+    _lastRefreshOk = Date.now();
   }catch(e){console.error('refresh',e)}
-  finally { _refreshInFlight = false; }
+  finally { _refreshInFlight = false; _refreshInFlightSince = 0; }
 }
 // Refresh cadence: 2s when visible, 10s when hidden.
 // Was 500ms which saturated Cloudflare tunnel at 10 req/sec × N tabs.
@@ -627,8 +698,93 @@ document.addEventListener('visibilitychange', scheduleRefresh);
 scheduleRefresh();
 refresh();
 
+// External watchdog: if no successful refresh in 15s, force-reset state and retry.
+// This catches cases where the timer died (tab throttling, exception in scheduler).
+setInterval(() => {
+  const stale = Date.now() - _lastRefreshOk;
+  if (stale > 15000) {
+    console.warn('[watchdog] No refresh in', stale, 'ms — forcing recovery');
+    _refreshInFlight = false;
+    _refreshInFlightSince = 0;
+    try { refresh(); } catch (e) { console.error('[watchdog] refresh threw', e); }
+    // Also reschedule the timer in case it died
+    scheduleRefresh();
+  }
+}, 5000);
+
+// Force-refresh on tab focus (user returning to the tab sees fresh data immediately)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    _refreshInFlight = false;
+    _refreshInFlightSince = 0;
+    refresh();
+  }
+});
+
 // Expose entry points for inline onclick handlers (module scope doesn't leak to window automatically).
 window.toggleBrowserAgent = (...args) => toggleBrowserAgent(...args);
+
+// Sweep: spend ALL UTXOs at this agent's address back to dispatch wallet.
+// Called before page reload to recover unspent fee UTXOs.
+async function sweepToDispatch() {
+  if (!BSV || !browserPrivKey) return;
+  try {
+    const { Transaction, P2PKH, Hash } = BSV;
+    const agentPubBytes = Array.from(browserPrivKey.toPublicKey().encode(true));
+    const pubkeyHash = Hash.hash160(agentPubBytes);
+    const agentAddr = browserPrivKey.toAddress();
+
+    // Fetch dispatch address from discover endpoint
+    const disc = await fetch('/api/discover').then(r => r.json()).catch(() => null);
+    if (!disc?.dispatchAddress) return;
+    const dispatchAddr = disc.dispatchAddress;
+
+    // Fetch unspent UTXOs at agent's address from WoC
+    const base = 'https://api.whatsonchain.com/v1/bsv/main';
+    const unspent = await fetch(base + '/address/' + agentAddr + '/unspent', { signal: AbortSignal.timeout(5000) }).then(r => r.json()).catch(() => []);
+    if (!unspent || unspent.length === 0) return;
+
+    const totalSats = unspent.reduce((s, u) => s + u.value, 0);
+    if (totalSats < 500) return; // not worth sweeping
+
+    console.log('[sweep] Found ' + unspent.length + ' UTXOs (' + totalSats + ' sats) — sweeping to ' + dispatchAddr);
+
+    const tx = new Transaction();
+    tx.version = 2;
+    for (const u of unspent) {
+      try {
+        const srcHex = await fetch(base + '/tx/' + u.tx_hash + '/hex', { signal: AbortSignal.timeout(3000) }).then(r => r.text());
+        const srcTx = Transaction.fromHex(srcHex);
+        tx.addInput({
+          sourceTransaction: srcTx,
+          sourceOutputIndex: u.tx_pos,
+          unlockingScriptTemplate: new P2PKH().unlock(browserPrivKey, 'all', false, u.value, new P2PKH().lock(agentAddr)),
+        });
+      } catch { /* skip this utxo */ }
+    }
+    if (tx.inputs.length === 0) return;
+
+    const fee = Math.ceil(tx.inputs.length * 150 * 0.15) + 100;
+    const changeSats = totalSats - fee;
+    if (changeSats < 1) return;
+    tx.addOutput({ lockingScript: new P2PKH().lock(dispatchAddr), satoshis: changeSats });
+    await tx.sign();
+
+    // Broadcast to all Arcade endpoints (fire-and-forget)
+    const efHex = tx.toHexEF();
+    const body = Uint8Array.from(efHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+    for (const ep of browserArcEndpoints) {
+      fetch(ep + '/tx', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body }).catch(() => {});
+    }
+    // Also try WoC
+    fetch(base + '/tx/raw', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ txhex: tx.toHex() }) }).catch(() => {});
+
+    console.log('[sweep] Swept ' + tx.inputs.length + ' UTXOs (' + changeSats + ' sats) → ' + dispatchAddr + ' txid=' + tx.id('hex').slice(0,16));
+  } catch (e) {
+    console.error('[sweep] Error:', e.message);
+  }
+}
+window._sweepToDispatch = sweepToDispatch;
 Object.defineProperty(window, 'browserAgentRunning', { get: () => browserAgentRunning });
 
 // ========== Browser Compute Agent ==========
@@ -710,10 +866,17 @@ async function toggleBrowserAgent() {
   // Note: server reuses existing agent record if same name re-registers (e.g. stop/start).
   // No name-availability check needed — the register call handles it.
 
+  // Wait for the async BSV SDK load (non-blocking at module level, so refresh
+  // works fine even while we're still loading). Show a status message if slow.
   if (!BSV) {
-    baLog('BSV SDK failed to load from CDN. Browser agent unavailable.', '#ff4444');
     $('browser-log').style.display = 'block';
-    return;
+    baLog('Loading BSV SDK from CDN...', '#ffaa00');
+    await _bsvReady;
+    if (!BSV) {
+      baLog('BSV SDK failed to load from CDN. Browser agent unavailable.', '#ff4444');
+      return;
+    }
+    baLog('BSV SDK loaded.', '#00aa00');
   }
 
   // Start
@@ -776,9 +939,9 @@ async function toggleBrowserAgent() {
       // Multiple endpoints rotate per request for load balancing & resilience.
       browserArcEndpoints = browserNetwork === 'mainnet'
         ? [
-            'https://arcade-us-1.bsvb.tech',
+            'https://arc.gorillapool.io/v1',
             'https://arcade-eu-1.bsvb.tech',
-            'https://arcade-ttn-us-1.bsvb.tech',
+            'https://arcade-us-1.bsvb.tech',
           ]
         : [
             'https://arcade-testnet-us-1.bsvb.tech',
@@ -817,14 +980,17 @@ async function toggleBrowserAgent() {
 
 // Local queue of pre-fetched work packages. Refilled in batches to amortize Cloudflare RTT.
 let workQueue = [];
-const WORK_BATCH_SIZE = 5;
+const WORK_BATCH_SIZE = 8; // GorillaPool is fast — genesis TX creation ~1-2s each
 let fetchInFlight = false; // prevent multiple simultaneous fetches from parallel workers
 
 async function fetchWorkBatch() {
   if (fetchInFlight) return; // coordinator — one fetch at a time
   fetchInFlight = true;
   try {
-    const r = await fetch('/api/agent/' + browserAgentId + '/work?count=' + WORK_BATCH_SIZE);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 45000); // 45s timeout — 5 genesis TXs at ~2-5s each
+    const r = await fetch('/api/agent/' + browserAgentId + '/work?count=' + WORK_BATCH_SIZE, { signal: ctrl.signal });
+    clearTimeout(timer);
     if (!r.ok) return;
     const data = await r.json();
     if (data.works && Array.isArray(data.works)) {
@@ -889,74 +1055,63 @@ async function broadcastChainBrowser(stepTxs) {
   }
 
   if (browserArc && stepTxs.length > 0 && typeof stepTxs[0] !== 'string') {
-    // Arcade broadcast with Extended Format (EF). Multiple endpoints rotate per request
-    // for load balancing. Parallel waves of N — TXs depend on each other but Arcade is
-    // generally OK accepting them slightly out of order with a brief retry on "missing parent".
+    // Arcade broadcast with Extended Format (EF).
+    // STRICT SEQUENTIAL: parent TX must be accepted before child is sent.
+    // Each TX goes to ALL endpoints in parallel (any-accept = success).
+    // Unrelated TXs (from different chains) are handled by PARALLEL_CHAINS.
     const ARCADE_ENDPOINTS = browserArcEndpoints;
-    const WAVE = 1; // sequential — chain TXs depend on each other; parallel races cause REJECTED cascades
-    let endpointIdx = 0;
 
-    async function sendOne(efHex, idx) {
+    // WoC base for fallback broadcasts (browser can call WoC directly)
+    const WOC_BASE = 'https://api.whatsonchain.com/v1/bsv/main';
+
+    async function sendOne(efHex, idx, rawHex) {
       const body = Uint8Array.from(efHex.match(/.{2}/g).map(b => parseInt(b, 16)));
-      // Up to 12 attempts for transient errors (SQLITE_BUSY). Capped wait 2s.
-      // Total budget: ~12 × ~1s = 12s per TX.
-      const MAX_ATTEMPTS = 12;
-      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        const url = ARCADE_ENDPOINTS[(endpointIdx + idx + attempt) % ARCADE_ENDPOINTS.length];
-        try {
-          const r = await fetch(url + '/tx', {
+
+      // GorillaPool first (fast, no rate limits, working)
+      // Then other endpoints. Fire all, return on first success.
+      const results = await Promise.allSettled(
+        ARCADE_ENDPOINTS.map(url =>
+          fetch(url + '/tx', {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
             body: body,
-          });
-          const respText = await r.text();
-          let respJson = null;
-          try { respJson = JSON.parse(respText); } catch {}
-          const txStatus = respJson?.txStatus || '';
-          const isOk = r.ok && txStatus !== 'REJECTED' && !respJson?.error;
-          if (isOk) return null;
+            signal: AbortSignal.timeout(8000),
+          }).then(async r => {
+            const txt = await r.text();
+            let j = null; try { j = JSON.parse(txt); } catch {}
+            return { ok: r.ok && j?.txStatus !== 'REJECTED' && !j?.error, errMsg: j?.extraInfo || j?.error || txt.slice(0, 100) };
+          })
+        )
+      );
+      if (results.some(r => r.status === 'fulfilled' && r.value.ok)) return null;
 
-          const errMsg = respJson?.extraInfo || respJson?.detail || respJson?.error || respText.slice(0, 200);
-          // Retry on any transient: 5xx, REJECTED, network / DB contention
-          const isRetryable = r.status >= 500
-            || txStatus === 'REJECTED'
-            || /missing|unknown|previous|not found|sqlite|busy|timeout|PROCESSING/i.test(errMsg);
-          if (isRetryable && attempt < MAX_ATTEMPTS - 1) {
-            // Linear backoff with jitter — exponential blew past the budget.
-            const waitMs = 400 + Math.random() * 800;
-            await new Promise(res => setTimeout(res, waitMs));
-            continue;
-          }
-          return { error: 'Arcade ' + r.status + '/' + (txStatus || 'err') + ': ' + errMsg.slice(0, 150) };
-        } catch (e) {
-          if (attempt < MAX_ATTEMPTS - 1) {
-            await new Promise(res => setTimeout(res, 400 + Math.random() * 800));
-            continue;
-          }
-          return { error: 'network: ' + String(e.message || e) };
-        }
+      // FALLBACK: WoC
+      try {
+        const wocR = await fetch(WOC_BASE + '/tx/raw', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txhex: rawHex }),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (wocR.ok) return null;
+        const wocTxt = await wocR.text();
+        return { error: wocTxt.slice(0, 100) };
+      } catch (e) {
+        return { error: String(e.message || e).slice(0, 80) };
       }
-      return { error: 'retries exhausted' };
     }
 
-    // Pre-serialize all TXs to EF
+    // Pre-serialize all TXs to both EF (for Arcade) and raw hex (for WoC fallback)
     const efHexes = stepTxs.map(tx => tx.toHexEF());
+    const rawHexes = stepTxs.map(tx => tx.toHex());
 
-    // Send in parallel waves (chain TXs are dependent but Arcade tolerates brief reordering)
-    for (let start = 0; start < efHexes.length; start += WAVE) {
-      const slice = efHexes.slice(start, start + WAVE);
-      const results = await Promise.allSettled(
-        slice.map((hex, j) => sendOne(hex, start + j))
-      );
-      for (let j = 0; j < results.length; j++) {
-        const r = results[j];
-        if (r.status === 'rejected' || (r.status === 'fulfilled' && r.value)) {
-          const msg = r.status === 'rejected' ? String(r.reason?.message || r.reason) : r.value.error;
-          if (/too.long.mempool|chain.too.long|limit.?ancestor/i.test(msg)) baBackoffUntil = Date.now() + 3500;
-          return { ok: false, error: 'arcade step ' + (start + j) + ': ' + msg };
-        }
+    // SEQUENTIAL: parent must be accepted before sending child.
+    for (let i = 0; i < efHexes.length; i++) {
+      const err = await sendOne(efHexes[i], i, rawHexes[i]);
+      if (err) {
+        if (/too.long.mempool|chain.too.long|limit.?ancestor/i.test(err.error)) baBackoffUntil = Date.now() + 3500;
+        return { ok: false, error: 'step ' + i + ': ' + err.error };
       }
-      endpointIdx = (endpointIdx + WAVE) % ARCADE_ENDPOINTS.length;
     }
     return { ok: true };
   }
@@ -977,7 +1132,7 @@ async function broadcastChainBrowser(stepTxs) {
 // Each chain is internally sequential (no intra-chain races) but multiple
 // chains run concurrently to amortize Cloudflare RTT and keep Arcade busy.
 // 3 works well — more causes Arcade contention and wasted genesis TXs.
-const PARALLEL_CHAINS = 3;
+const PARALLEL_CHAINS = 8;
 
 async function browserWorkLoop(myToken) {
   // Spawn N parallel workers — each pulls work from the shared queue,
@@ -1096,54 +1251,61 @@ async function parallelChainWorker(myToken, workerId) {
       if (feePackage && feePackage.utxos && feePackage.utxos.length > 0) {
         if (workerId === 0) $('ba-status').textContent = 'adding fees...';
         try {
-          rebuiltTxObjects = await rebuildChainWithFees(chain, feePackage.utxos);
+          rebuiltTxObjects = await rebuildChainWithFees(chain, feePackage.utxos, work.genesisVout || 0);
         } catch (rebuildErr) {
           baLog('Fee rebuild failed: ' + rebuildErr.message + ' — broadcasting without fees', '#ffaa00');
         }
       }
 
-      // Step 3: Broadcast rebuilt chain with fees
-      if (workerId === 0) $('ba-status').textContent = 'broadcasting...';
+      // Step 3: PIPELINE — fire-and-forget broadcast, immediately compute next molecule.
+      // The broadcast takes 50-90s for 20+ TXs. Don't block the compute loop.
+      const txsToBroadcast = rebuiltTxObjects || chain.txHexes.slice(1);
+      const workIdForBcast = work.id;
+      const chainLen = chain.txHexes.length;
+      const reward = passRes.reward || 100;
 
-      const bcastRes = await broadcastChainBrowser(rebuiltTxObjects || chain.txHexes.slice(1));
-      const bcastMs = (performance.now() - t2).toFixed(0);
-
-      if (!bcastRes.ok) {
-        const errMsg = bcastRes.errors && bcastRes.errors.length
-          ? 'step ' + bcastRes.errors[0].index + ': ' + bcastRes.errors[0].error
-          : (bcastRes.error || 'unknown');
-        baLog('Broadcast failed: ' + errMsg, '#ff4444');
-        const failRes = await fetch('/api/agent/' + browserAgentId + '/fail', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ workId: work.id, finalScore: totalScore }),
-        }).then(r => r.json());
-        if (failRes.reward) baStats.earned += failRes.reward;
-        nextPrepPromise = prepareNextWork(failRes.nextWork || null);
-        baUpdateStats();
-        continue;
-      }
-
-      baStats.txs += chain.txHexes.length;
-      baStats.passed++;
-      baStats.earned += (passRes.reward || 100);
-      baLog('PASS ' + molId + ' score=' + totalScore + ' compute=' + computeMs + 'ms build=' + buildMs + 'ms bcast=' + bcastMs + 'ms ' + chain.txHexes.length + ' TXs', '#00ff88');
-
-      // Compute correct TXIDs from the broadcast chain TXs
-      const broadcastSrc = rebuiltTxObjects || chain.txHexes.slice(1);
-      const broadcastTxids = broadcastSrc.map(function(txOrHex) {
+      // Compute TXIDs now (before async)
+      const broadcastTxids = txsToBroadcast.map(function(txOrHex) {
         if (typeof txOrHex === 'string') return BSV.Transaction.fromHex(txOrHex).id('hex');
         return txOrHex.id('hex');
       });
 
-      // Confirm broadcast — wait for response to get next work assignment
-      const confirmRes = await fetch('/api/agent/' + browserAgentId + '/confirm', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ workId: work.id, txids: broadcastTxids }),
-      }).then(r => r.json()).catch(() => ({}));
-      nextPrepPromise = prepareNextWork(confirmRes.nextWork || null);
+      // Fire-and-forget: broadcast + confirm happens in background
+      (async function() {
+        try {
+          const bcastRes = await broadcastChainBrowser(txsToBroadcast);
+          const bcastMs = (performance.now() - t2).toFixed(0);
 
+          if (!bcastRes.ok) {
+            const errMsg = bcastRes.errors && bcastRes.errors.length
+              ? 'step ' + bcastRes.errors[0].index + ': ' + bcastRes.errors[0].error
+              : (bcastRes.error || 'unknown');
+            baLog('Broadcast failed: ' + errMsg, '#ff4444');
+            await fetch('/api/agent/' + browserAgentId + '/fail', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ workId: workIdForBcast, finalScore: 999999 }),
+            }).catch(() => {});
+            return;
+          }
+
+          baStats.txs += chainLen;
+          baStats.passed++;
+          baStats.earned += reward;
+          baLog('PASS ' + molId + ' score=' + totalScore + ' bcast=' + bcastMs + 'ms ' + chainLen + ' TXs', '#00ff88');
+
+          await fetch('/api/agent/' + browserAgentId + '/confirm', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ workId: workIdForBcast, txids: broadcastTxids }),
+          }).catch(() => {});
+          baUpdateStats();
+        } catch (e) {
+          baLog('Broadcast error: ' + e.message, '#ff4444');
+        }
+      })();
+
+      // DON'T await — immediately continue to next work
       baUpdateStats();
       if (workerId === 0) $('ba-status').textContent = 'wkr0: idle';
 
@@ -1265,7 +1427,7 @@ function buildChainLockScriptBrowser(numAtoms, score, compiledAsm) {
 // Rebuild chain step TXs with fee UTXOs as input 1.
 // The covenant scriptSig on input 0 embeds the previous txid, so adding inputs
 // changes the current txid which changes the next step's scriptSig → must rebuild all.
-async function rebuildChainWithFees(chain, feeUtxos) {
+async function rebuildChainWithFees(chain, feeUtxos, genesisVout = 0) {
   const { Transaction, Script, TransactionSignature, Hash, UnlockingScript } = BSV;
   const stepTxHexes = chain.txHexes.slice(1); // skip genesis
   if (feeUtxos.length < stepTxHexes.length) {
@@ -1293,16 +1455,19 @@ async function rebuildChainWithFees(chain, feeUtxos) {
     newTx.version = 2;
     newTx.lockTime = 0;
 
-    // Input 0: covenant UTXO (data-push scriptSig, not signature-based)
+    // Input 0: covenant UTXO. First step uses genesisVout, subsequent use 0.
+    const prevOutputIndex = (i === 0) ? genesisVout : 0;
     newTx.addInput({
       sourceTransaction: prevTx,
-      sourceOutputIndex: 0,
+      sourceOutputIndex: prevOutputIndex,
       unlockingScript: Script.fromHex(newScriptSig),
       sequence: 0xffffffff,
     });
 
-    // Input 1: fee UTXO — P2PK unlock signed by browser's ephemeral key
+    // Input 1: fee UTXO — P2PKH unlock (sig + pubkey) signed by browser's ephemeral key.
+    // Dispatch now creates fee UTXOs as P2PKH because Teranode rejects bare P2PK.
     const feeSats = fee.satoshis;
+    const pubKeyBytes = Array.from(browserPrivKey.toPublicKey().encode(true));
     newTx.addInput({
       sourceTransaction: feeSrcTx,
       sourceOutputIndex: fee.vout,
@@ -1328,9 +1493,13 @@ async function rebuildChainWithFees(chain, feeUtxos) {
           const rawSig = browserPrivKey.sign(Hash.sha256(preimage));
           const sig = new TransactionSignature(rawSig.r, rawSig.s, scope);
           const sigBytes = sig.toChecksigFormat();
-          return new UnlockingScript([{ op: sigBytes.length, data: sigBytes }]);
+          // P2PKH unlock: push <sig> then push <pubkey>
+          return new UnlockingScript([
+            { op: sigBytes.length, data: sigBytes },
+            { op: pubKeyBytes.length, data: pubKeyBytes },
+          ]);
         },
-        estimateLength: async function() { return 74; },
+        estimateLength: async function() { return 74 + 34; }, // sig ~74 + pubkey 33 + 1 push byte
       },
       sequence: 0xffffffff,
     });
@@ -1368,17 +1537,26 @@ function buildChainBrowser(work, stepBatches) {
   let currentTxid = genesisTxid;
   let currentScore = 0;
 
+  // genesisVout: which output of the genesis TX is THIS molecule's covenant.
+  // For single genesis (1 molecule per TX): always 0.
+  // For batch genesis (N molecules per TX): 0, 1, 2, ..., N-1.
+  const genesisVout = work.genesisVout ?? 0;
+
   for (let step = 0; step < numSteps; step++) {
     const batch = stepBatches[step];
     const newScore = currentScore + batch.batchTotal;
     const scriptSigHex = buildChainScriptSigBrowser(currentTxid, 1, batch.batchTotal, newScore, batch.pairs);
+
+    // First step uses genesisVout (could be >0 in batch genesis).
+    // Subsequent steps always use output 0 (covenant continuation).
+    const prevOutputIndex = step === 0 ? genesisVout : 0;
 
     const chainTx = new Transaction();
     chainTx.version = 2;
     chainTx.lockTime = 0;
     chainTx.addInput({
       sourceTransaction: prevTx,
-      sourceOutputIndex: 0,
+      sourceOutputIndex: prevOutputIndex,
       unlockingScript: Script.fromHex(scriptSigHex),
       sequence: 0xffffffff,
     });

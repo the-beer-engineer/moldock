@@ -55,12 +55,13 @@ let dispatchReady = false;
 async function initDispatch(): Promise<void> {
   console.log(`\n[init] Compiling covenant scripts (~10s)...`);
   dispatch = new DispatchManager(wallet);
-  // Check for new deposits (UTXOs are restored from state file in constructor)
-  await dispatch.scanForDeposits();
-  // Fan out any large UTXOs so parallel agents don't contend
-  await dispatch.fanOutIfNeeded(500000, 50, 300000);
+  // Give scan 120s — it now fetches TX hex in parallel batches (not rate-limited)
+  const scanTimeout = new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), 120_000));
+  try { await Promise.race([dispatch.scanForDeposits(), scanTimeout]); } catch (e: any) { console.log(`[init] Scan incomplete: ${e.message}`); }
+  // Skip init fan-out — we have thousands of UTXOs on chain already.
+  // Fan-out runs on timer only when < 100 UTXOs.
   dispatchReady = true;
-  console.log(`[init] Dispatch ready — accepting compute agents on http://localhost:${PORT}`);
+  console.log(`[init] Dispatch ready — ${dispatch.dispatchWallet.getUtxos().filter(u => u.script?.startsWith('76a914')).length} P2PKH UTXOs available`);
 }
 
 // --- Autonomous Bounty Posting ---
@@ -150,6 +151,7 @@ function serializeWork(work: any) {
     compiledAsm: work.compiledAsm,
     genesisTxHex: work.genesisTxHex,
     genesisTxid: work.genesisTxid,
+    genesisVout: work.genesisVout ?? 0,
     numSteps: work.numSteps,
   };
 }
@@ -157,6 +159,11 @@ function serializeWork(work: any) {
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
   const method = req.method ?? 'GET';
+
+  // Log API requests (skip static/dashboard/version/stats)
+  if (url.pathname.startsWith('/api/') && !['version','stats','dashboard-data','events','agents'].some(s => url.pathname.includes(s))) {
+    console.log(`[http] ${method} ${url.pathname}${url.search}`);
+  }
 
   if (method === 'OPTIONS') {
     res.writeHead(204, {
@@ -174,7 +181,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const acceptEncoding = (req.headers['accept-encoding'] || '') as string;
     const headers: Record<string, string> = {
       'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'public, max-age=10', // short cache to ease repeated tab opens
+      'Cache-Control': 'no-cache, no-store, must-revalidate', // never cache — code changes frequently
     };
     if (acceptEncoding.includes('gzip')) {
       const zlib = await import('zlib');
@@ -280,7 +287,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // --- Agent Work (single, legacy) ---
   const agentWorkMatch = url.pathname.match(/^\/api\/agent\/([^/]+)\/work$/);
   if (method === 'GET' && agentWorkMatch) {
-    if (!dispatch) { json(res, { error: 'Dispatch initializing' }, 503); return; }
+    if (!dispatch || !dispatchReady) { json(res, { error: 'Dispatch initializing (fan-out in progress)' }, 503); return; }
     const agentId = agentWorkMatch[1];
     const count = parseInt(url.searchParams.get('count') ?? '1', 10);
     if (count > 1) {
@@ -436,6 +443,103 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // --- Debug: call the real pickWalletUtxos function ---
+  if (method === 'GET' && url.pathname === '/api/debug-test-pick') {
+    if (!dispatch) return json(res, { error: 'not ready' }, 503);
+    const sats = parseInt(url.searchParams.get('sats') ?? '500', 10);
+    const result = await dispatch.debugPickWalletUtxos(sats);
+    json(res, result);
+    return;
+  }
+
+  // --- Debug: wallet mutation stats ---
+  if (method === 'GET' && url.pathname === '/api/debug-stats') {
+    json(res, {
+      stats: (wallet as any)._stats,
+      memory: {
+        total: wallet.getUtxos().length,
+        confirmedSats: wallet.spendableBalance,
+        pendingSats: wallet.pendingBalance,
+      },
+    });
+    return;
+  }
+
+  // --- Debug: wallet picking diagnostics ---
+  if (method === 'GET' && url.pathname === '/api/debug-pick') {
+    const all = wallet.getUtxos();
+    const pending = all.filter(u => u.pending).length;
+    const noSourceTx = all.filter(u => !u.sourceTransaction).length;
+    const havePickable = all.filter(u => u.sourceTransaction && !u.pending).length;
+    const pickableSats = all.filter(u => u.sourceTransaction && !u.pending).reduce((s, u) => s + u.satoshis, 0);
+    const samples = all.slice(0, 5).map(u => ({
+      txid: u.txid.slice(0, 16),
+      vout: u.vout,
+      sats: u.satoshis,
+      pending: !!u.pending,
+      hasSourceTx: !!u.sourceTransaction,
+    }));
+    json(res, { total: all.length, pending, noSourceTx, havePickable, pickableSats, samples });
+    return;
+  }
+
+  // --- Debug: wallet state breakdown ---
+  if (method === 'GET' && url.pathname === '/api/debug-wallet') {
+    const utxos = wallet.getUtxos();
+    const pending = utxos.filter(u => u.pending);
+    const confirmed = utxos.filter(u => !u.pending);
+    const pendingSats = pending.reduce((s, u) => s + u.satoshis, 0);
+    const confirmedSats = confirmed.reduce((s, u) => s + u.satoshis, 0);
+    const includeAll = url.searchParams.get('all') === '1';
+    json(res, {
+      total: utxos.length,
+      confirmed: confirmed.length,
+      confirmedSats,
+      pending: pending.length,
+      pendingSats,
+      topPending: pending
+        .sort((a, b) => b.satoshis - a.satoshis)
+        .slice(0, 10)
+        .map(u => ({ txid: u.txid, vout: u.vout, sats: u.satoshis })),
+      topConfirmed: confirmed
+        .sort((a, b) => b.satoshis - a.satoshis)
+        .slice(0, 10)
+        .map(u => ({ txid: u.txid, vout: u.vout, sats: u.satoshis })),
+      all: includeAll ? utxos.map(u => ({
+        txid: u.txid, vout: u.vout, sats: u.satoshis, pending: !!u.pending,
+      })) : undefined,
+    });
+    return;
+  }
+
+  // --- Debug: force sweep of ALL pending ---
+  if (method === 'POST' && url.pathname === '/api/debug-sweep-pending') {
+    const result = wallet.sweepStalePending(0); // TTL 0 = drop all pending
+    json(res, { dropped: result.count, sats: result.sats });
+    return;
+  }
+
+  // --- Reconcile wallet with chain (WoC). Drops in-memory UTXOs and replaces
+  //     from on-chain truth. Returns before/after summary. ---
+  if (method === 'POST' && url.pathname === '/api/reconcile') {
+    if (!dispatch) return json(res, { error: 'Dispatch not ready' }, 503);
+    try {
+      const before = {
+        utxos: wallet.getUtxos().length,
+        sats: wallet.balance,
+      };
+      const result = await dispatch.reconcileFromChain();
+      const after = {
+        utxos: wallet.getUtxos().length,
+        sats: wallet.balance,
+      };
+      json(res, { before, after, ...result });
+    } catch (err: any) {
+      json(res, { error: err.message }, 500);
+    }
+    return;
+  }
+
   // --- Scan for new funding UTXOs ---
   // Fix startTime if it's 0 but agents have done work
   if (method === 'POST' && url.pathname === '/api/fix-timer') {
@@ -450,8 +554,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   if (method === 'POST' && url.pathname === '/api/scan-funding') {
     try {
-      // Scan for new P2PKH deposits, then return balance from persisted UTXO set
-      if (dispatch) await dispatch.scanForDeposits();
+      // CRITICAL: do NOT call scanForDeposits here. It was being hit by every
+      // browser tab, triggering repeated WoC queries. WoC's unspent indexer lags
+      // ARC by 5-30s and keeps returning UTXOs we've already spent — each scan
+      // added phantom "new deposits" to memory, inflating balance by 10x-100x.
+      // Now just returns current balance without scanning.
       const balance = dispatch ? (await dispatch.getUnifiedStats()).walletBalanceSats : 0;
       json(res, { balance, address: wallet.address, utxos: dispatch ? (await dispatch.getUnifiedStats()).walletUtxoCount : 0 });
     } catch (err: any) {
@@ -524,6 +631,54 @@ server.listen(PORT, async () => {
     try { dispatch.cleanupStaleWork(); } catch (err: any) { console.error(`[cleanup] error: ${err.message}`); }
   }, 2 * 60 * 1000);
   console.log(`[server] Stale work cleanup ticker enabled (2 min)`);
+
+  // Stale pending UTXO sweep — only triggers at a long TTL (10 min). A pending
+  // UTXO > 10 min old means its parent broadcast never reported back — truly stuck.
+  // (Shorter TTL was losing legit UTXOs when clearPending was slightly delayed.)
+  setInterval(() => {
+    try {
+      const result = wallet.sweepStalePending(10 * 60 * 1000);
+      if (result.count > 0) {
+        console.log(`[pending-sweep] Dropped ${result.count} stuck pending UTXOs (${result.sats} sats)`);
+      }
+    } catch (err: any) { console.error(`[pending-sweep] error: ${err.message}`); }
+  }, 60 * 1000);
+  console.log(`[server] Stale pending sweep enabled (60s, TTL 10min)`);
+
+  // Wallet-TX verification — every 3s, promotes pending change outputs to confirmed
+  // once their parent TX is visible on chain. Removes ghosts after 15s of missing.
+  setInterval(async () => {
+    if (!dispatch) return;
+    try {
+      const result = await dispatch.verifyWalletTxs({ minAgeMs: 1_000, maxPerRun: 50 });
+      if (result.promoted > 0 || result.ghosts > 0) {
+        console.log(`[verify-tick] promoted=${result.promoted} ghosts=${result.ghosts}`);
+      }
+    } catch (err: any) { console.error(`[verify-tick] error: ${err.message}`); }
+  }, 3 * 1000);
+  console.log(`[server] Wallet-TX verify ticker enabled (3s)`);
+
+  // Periodic deposit scan — every 45s, check for new P2PKH deposits on chain.
+  // Uses the confirmed+unspent check so it won't pull in mempool ghosts.
+  // This recovers broadcasts that succeeded but weren't tracked by our phase3 addUtxo.
+  setInterval(async () => {
+    if (!dispatch) return;
+    try {
+      await dispatch.scanForDeposits();
+    } catch (err: any) { console.error(`[scan-tick] error: ${err.message}`); }
+  }, 45 * 1000);
+  console.log(`[server] Periodic deposit scan enabled (45s)`);
+
+  // Fan-out only when critically low (< 100 UTXOs). We have thousands on chain
+  // already; aggressive fan-out is counterproductive.
+  setInterval(async () => {
+    if (!dispatch || !dispatchReady) return;
+    const utxoCount = dispatch.dispatchWallet.getUtxos().filter((u: any) => u.script?.startsWith('76a914')).length;
+    if (utxoCount < 100) {
+      try { await dispatch.fanOutVaried(); } catch { /* logged inside */ }
+    }
+  }, 30 * 1000);
+  console.log(`[server] Fan-out enabled (30s, triggers only when < 100 UTXOs)`);
 });
 
 function sleep(ms: number): Promise<void> {

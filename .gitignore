@@ -19,6 +19,9 @@ dist/
 bitcoin-data/
 regtest-data/
 
+# Data files
+data/
+
 # IDE & OS
 .DS_Store
 .vscode/
@@ -31,3 +34,7 @@ regtest-data/
 
 # Runtime state
 .moldock-state.json
+.moldock-state.json.*
+
+# Logs
+*.log
