@@ -148,7 +148,7 @@ export class ArcAdapter implements NetworkAdapter {
   // Bumped to 8 — user needs 20+ tx/sec throughput.
   private _inFlight = 0;
   private _queue: Array<() => void> = [];
-  private readonly MAX_CONCURRENT = 24;
+  private readonly MAX_CONCURRENT = 12;
 
   constructor(
     networkType: 'testnet' | 'mainnet',
@@ -233,79 +233,64 @@ export class ArcAdapter implements NetworkAdapter {
   private async _broadcastInner(tx: Transaction): Promise<string> {
     const efHex = tx.toHexEF();
     const body = Buffer.from(efHex, 'hex');
-    const rawHex = tx.toHex();
     const txid = tx.id('hex');
 
-    // PRIMARY: Arcade — broadcast to ALL endpoints in parallel.
-    // No rate limits (unlike WoC's ~3/sec). Any endpoint accepting = success.
-    let lastArcadeErr = '';
-    let anyAccepted = false;
-    const arcResults = await Promise.allSettled(
-      this.endpoints.map(async (endpoint) => {
-        try {
-          const response = await fetch(`${endpoint}/tx`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body,
-            signal: AbortSignal.timeout(5_000),
-          });
+    // RACE: fire at ALL endpoints, resolve on FIRST success.
+    // GorillaPool (~200ms) wins the race; broken Arcade endpoints don't slow us down.
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let failCount = 0;
+      const total = this.endpoints.length;
+      let lastErr = '';
+      let mempoolConflict = false;
+
+      for (const endpoint of this.endpoints) {
+        fetch(`${endpoint}/tx`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body,
+          signal: AbortSignal.timeout(8_000),
+        }).then(async (response) => {
           const respText = await response.text();
           let respJson: any = null;
           try { respJson = JSON.parse(respText); } catch {}
-          const txStatus = respJson?.txStatus || '';
-          const isAccepted = response.ok && txStatus !== 'REJECTED' && !respJson?.error;
+          const isAccepted = response.ok && respJson?.txStatus !== 'REJECTED' && !respJson?.error;
           const errorMsg = respJson?.extraInfo || respJson?.detail || respJson?.error || respText.slice(0, 200);
-          if (/SQLITE_BUSY|database is locked/i.test(errorMsg)) this.recordBusy();
-          if (/258.*mempool.conflict|mempool conflict/i.test(errorMsg)) {
-            throw new Error(`MEMPOOL_CONFLICT:${txid}`);
+
+          if (/mempool.conflict/i.test(errorMsg)) {
+            mempoolConflict = true;
           }
-          return { endpoint, isAccepted, txid: respJson?.txid, errorMsg };
-        } catch (e: any) {
-          if (e.message?.startsWith('MEMPOOL_CONFLICT')) throw e;
-          return { endpoint, isAccepted: false, txid: null, errorMsg: e.message };
-        }
-      })
-    );
-    // Check for mempool conflict thrown from any endpoint
-    for (const r of arcResults) {
-      if (r.status === 'rejected' && String(r.reason?.message || '').startsWith('MEMPOOL_CONFLICT')) {
-        throw r.reason;
-      }
-    }
-    for (const r of arcResults) {
-      if (r.status === 'fulfilled' && r.value.isAccepted) {
-        anyAccepted = true;
-      } else if (r.status === 'fulfilled') {
-        lastArcadeErr = r.value.errorMsg;
-      }
-    }
-    if (anyAccepted) return txid;
 
-    // All Arcade endpoints rejected — fall back to WoC.
-    // Arcade/Teranode is currently returning 500 for valid TXs.
-    // WoC has rate limits (~3/sec) but actually accepts valid TXs.
-    const wocBase = this.networkType === 'mainnet'
-      ? 'https://api.whatsonchain.com/v1/bsv/main'
-      : 'https://api.whatsonchain.com/v1/bsv/test';
-    try {
-      const r = await fetch(`${wocBase}/tx/raw`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ txhex: rawHex }),
-        signal: AbortSignal.timeout(8_000),
-      });
-      const txt = await r.text();
-      if (r.status === 200) {
-        return txt.replace(/"/g, '').trim() || txid;
+          if (isAccepted && !settled) {
+            settled = true;
+            resolve(txid);
+            return;
+          }
+          lastErr = errorMsg;
+          failCount++;
+          if (failCount >= total && !settled) {
+            settled = true;
+            if (mempoolConflict) {
+              reject(new Error(`MEMPOOL_CONFLICT:${txid}`));
+            } else {
+              reject(new Error(`Broadcast failed: ${lastErr.slice(0, 150)}`));
+            }
+          }
+        }).catch((e: any) => {
+          if (e.message?.includes('MEMPOOL_CONFLICT')) mempoolConflict = true;
+          failCount++;
+          lastErr = e.message || 'network error';
+          if (failCount >= total && !settled) {
+            settled = true;
+            if (mempoolConflict) {
+              reject(new Error(`MEMPOOL_CONFLICT:${txid}`));
+            } else {
+              reject(new Error(`Broadcast failed: ${lastErr.slice(0, 150)}`));
+            }
+          }
+        });
       }
-      if (/258.*mempool.conflict/i.test(txt)) {
-        throw new Error(`MEMPOOL_CONFLICT:${txid}`);
-      }
-    } catch (err: any) {
-      if (err.message?.startsWith('MEMPOOL_CONFLICT')) throw err;
-    }
-
-    throw new Error(`Broadcast failed: ${lastArcadeErr.slice(0,150)}`);
+    });
   }
 
   /** Broadcast multiple UNRELATED transactions in a single batch API call.

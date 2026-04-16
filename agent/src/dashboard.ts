@@ -406,8 +406,43 @@ function showMolModal(jsonStrOrEl) {
       // Wallet balance display — use chain balance (stable)
       const balEl = document.getElementById('wallet-balance');
       if (balEl) balEl.textContent = (((s.chainBalanceSats||s.walletBalanceSats||0))/1e8).toFixed(4) + ' BSV';
-      // Agents table: DON'T update from fallback — let the module refresh handle it
-      // with full colors, trust badges, and status. Fallback only updates stats panels.
+      // Agents table — render from fallback too in case module script is slow/broken
+      var _fbColors = ['#00ccff','#00ff88','#ffaa00','#ff6699','#aa88ff','#88ddff','#44ffaa','#ffcc44'];
+      var _fbTrustLabels = ['NEW','PROVEN','TRUSTED'];
+      function _fbTrustBadge(level) {
+        return '<span class="trust-badge trust-' + level + '">' + (_fbTrustLabels[level] || '?') + '</span>';
+      }
+      function _fbFmtBytes(b) { if(!b) return '0B'; if(b>1048576) return (b/1048576).toFixed(1)+'MB'; if(b>1024) return (b/1024).toFixed(0)+'KB'; return b+'B'; }
+      var agents = data.agents || [];
+      var agentsTable = document.getElementById('agents-table');
+      var agentsWrap = document.getElementById('agents-table-wrap');
+      var agentsEmpty = document.getElementById('agents-empty');
+      if (agentsTable && agentsWrap && agentsEmpty) {
+        if (agents.length === 0) {
+          agentsEmpty.style.display = 'block';
+          agentsWrap.style.display = 'none';
+        } else {
+          agentsEmpty.style.display = 'none';
+          agentsWrap.style.display = 'table';
+          agentsTable.innerHTML = agents.map(function(a, i) {
+            var color = _fbColors[i % _fbColors.length];
+            var statusHtml = a.status === 'working'
+              ? '<span class="status-working">' + (a.currentMoleculeId || '').slice(0, 18) + '</span>'
+              : a.status === 'idle' ? '<span class="status-idle">idle</span>'
+              : '<span class="status-offline">offline</span>';
+            return '<tr class="agent-row">' +
+              '<td><span class="agent-name" style="color:' + color + '">' + a.name + '</span></td>' +
+              '<td>' + _fbTrustBadge(a.trustLevel || 0) + '</td>' +
+              '<td>' + statusHtml + '</td>' +
+              '<td>' + (a.processed || 0) + '</td>' +
+              '<td class="pass">' + (a.passed || 0) + '</td>' +
+              '<td class="fail">' + (a.failed || 0) + '</td>' +
+              '<td style="color:#ffaa00">' + ((a.totalRewards || 0) > 0 ? a.totalRewards.toLocaleString() + ' sats' : '0') + '</td>' +
+              '<td>' + (a.totalTxs || 0) + '</td>' +
+              '<td style="color:#888">' + _fbFmtBytes(a.totalBytes || 0) + '</td></tr>';
+          }).join('');
+        }
+      }
     } catch {}
     finally { _fbInFlight = false; }
   }
@@ -941,7 +976,6 @@ async function toggleBrowserAgent() {
         ? [
             'https://arc.gorillapool.io/v1',
             'https://arcade-eu-1.bsvb.tech',
-            'https://arcade-us-1.bsvb.tech',
           ]
         : [
             'https://arcade-testnet-us-1.bsvb.tech',
@@ -980,7 +1014,7 @@ async function toggleBrowserAgent() {
 
 // Local queue of pre-fetched work packages. Refilled in batches to amortize Cloudflare RTT.
 let workQueue = [];
-const WORK_BATCH_SIZE = 8; // GorillaPool is fast — genesis TX creation ~1-2s each
+const WORK_BATCH_SIZE = 8; // Match PARALLEL_CHAINS — fill all workers in one fetch
 let fetchInFlight = false; // prevent multiple simultaneous fetches from parallel workers
 
 async function fetchWorkBatch() {
@@ -1010,14 +1044,15 @@ async function fetchWorkBatch() {
 async function prepareNextWork(seed) {
   let work = seed || null;
   if (!work) {
-    // Refill queue if empty
-    if (workQueue.length === 0) await fetchWorkBatch();
+    // Refill queue if empty or low — keep pipeline full for all parallel chain workers
+    if (workQueue.length < PARALLEL_CHAINS) await fetchWorkBatch();
     if (workQueue.length === 0) return null;
     work = workQueue.shift();
-    // Pre-fetch next batch when queue is half empty (overlap with chain compute/broadcast)
-    if (workQueue.length <= 2) {
-      fetchWorkBatch().catch(() => {});
-    }
+  }
+  // ALWAYS pre-fetch in background when queue is below target.
+  // This ensures the next worker doesn't have to wait.
+  if (workQueue.length < PARALLEL_CHAINS) {
+    fetchWorkBatch().catch(() => {});
   }
   const tCompute = performance.now();
   const stepBatches = [];
@@ -1061,53 +1096,80 @@ async function broadcastChainBrowser(stepTxs) {
     // Unrelated TXs (from different chains) are handled by PARALLEL_CHAINS.
     const ARCADE_ENDPOINTS = browserArcEndpoints;
 
-    // WoC base for fallback broadcasts (browser can call WoC directly)
-    const WOC_BASE = 'https://api.whatsonchain.com/v1/bsv/main';
-
-    async function sendOne(efHex, idx, rawHex) {
-      const body = Uint8Array.from(efHex.match(/.{2}/g).map(b => parseInt(b, 16)));
-
-      // GorillaPool first (fast, no rate limits, working)
-      // Then other endpoints. Fire all, return on first success.
-      const results = await Promise.allSettled(
-        ARCADE_ENDPOINTS.map(url =>
-          fetch(url + '/tx', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: body,
-            signal: AbortSignal.timeout(8000),
-          }).then(async r => {
-            const txt = await r.text();
-            let j = null; try { j = JSON.parse(txt); } catch {}
-            return { ok: r.ok && j?.txStatus !== 'REJECTED' && !j?.error, errMsg: j?.extraInfo || j?.error || txt.slice(0, 100) };
-          })
-        )
-      );
-      if (results.some(r => r.status === 'fulfilled' && r.value.ok)) return null;
-
-      // FALLBACK: WoC
-      try {
-        const wocR = await fetch(WOC_BASE + '/tx/raw', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txhex: rawHex }),
-          signal: AbortSignal.timeout(8000),
-        });
-        if (wocR.ok) return null;
-        const wocTxt = await wocR.text();
-        return { error: wocTxt.slice(0, 100) };
-      } catch (e) {
-        return { error: String(e.message || e).slice(0, 80) };
-      }
+    // Shared batch queue: multiple chains push their next TX here.
+    // A flush loop sends them all in ONE /txs batch request every 50ms.
+    // This turns 8 separate HTTP requests into 1 batch request.
+    if (!window._bcastQueue) {
+      window._bcastQueue = []; // { efHex, resolve }
+      window._bcastFlushRunning = false;
     }
 
-    // Pre-serialize all TXs to both EF (for Arcade) and raw hex (for WoC fallback)
-    const efHexes = stepTxs.map(tx => tx.toHexEF());
-    const rawHexes = stepTxs.map(tx => tx.toHex());
+    async function flushBatchQueue() {
+      if (window._bcastFlushRunning) return;
+      window._bcastFlushRunning = true;
+      while (window._bcastQueue.length > 0) {
+        // Wait 800ms to accumulate TXs from all parallel chains
+        await new Promise(function(r) { setTimeout(r, 800); });
+        var batch = window._bcastQueue.splice(0);
+        if (batch.length === 0) continue;
 
-    // SEQUENTIAL: parent must be accepted before sending child.
+        // Direct to GorillaPool /txs with hard 8s timeout via Promise.race
+        var rawTxs = batch.map(function(item) { return { rawTx: item.efHex }; });
+        var results = null;
+        try {
+          var txt = await Promise.race([
+            fetch(ARCADE_ENDPOINTS[0] + '/txs', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(rawTxs),
+            }).then(function(r) { return r.text(); }),
+            new Promise(function(_, rej) { setTimeout(function() { rej(new Error('timeout')); }, 8000); }),
+          ]);
+          try { results = JSON.parse(txt); } catch(e) {}
+        } catch(e) {}
+
+        if (Array.isArray(results) && results.length === batch.length) {
+          for (var i = 0; i < batch.length; i++) {
+            var s = results[i];
+            var ok = s && s.txStatus && s.txStatus !== 'REJECTED' && !s.error;
+            batch[i].resolve(ok ? null : { error: (s && s.extraInfo) || 'rejected' });
+          }
+        } else {
+          // Batch failed/timeout — fall back to individual /tx calls in parallel
+          var promises = batch.map(function(item) {
+            var body = Uint8Array.from(item.efHex.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+            return fetch(ARCADE_ENDPOINTS[0] + '/tx', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: body,
+            }).then(function(r) { return r.text().then(function(txt2) {
+              var j2 = null; try { j2 = JSON.parse(txt2); } catch(e) {}
+              var ok2 = r.ok && j2 && j2.txStatus !== 'REJECTED' && !j2.error;
+              item.resolve(ok2 ? null : { error: (j2 && j2.extraInfo) || txt2.slice(0, 80) });
+            }); }).catch(function() { item.resolve({ error: 'network error' }); });
+          });
+          await Promise.all(promises);
+        }
+      }
+      window._bcastFlushRunning = false;
+    }
+
+    async function sendOne(efHex, idx) {
+      // Push to shared queue, get result when batch flushes
+      return new Promise(function(resolve) {
+        window._bcastQueue.push({ efHex: efHex, resolve: resolve });
+        flushBatchQueue();
+      });
+    }
+
+    // Pre-serialize all TXs to EF
+    const efHexes = stepTxs.map(tx => tx.toHexEF());
+
+    // SEQUENTIAL per chain: parent must be accepted before sending child.
+    // But sendOne pushes to a shared batch queue — unrelated TXs from
+    // other chains get batched together in the same HTTP request.
     for (let i = 0; i < efHexes.length; i++) {
-      const err = await sendOne(efHexes[i], i, rawHexes[i]);
+      const err = await sendOne(efHexes[i], i);
       if (err) {
         if (/too.long.mempool|chain.too.long|limit.?ancestor/i.test(err.error)) baBackoffUntil = Date.now() + 3500;
         return { ok: false, error: 'step ' + i + ': ' + err.error };

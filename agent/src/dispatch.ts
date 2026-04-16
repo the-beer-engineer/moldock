@@ -267,14 +267,18 @@ export class DispatchManager {
       if (!parentTxs.has(u.txid)) parentTxs.set(u.txid, new Set());
       parentTxs.get(u.txid)!.add(u.vout);
     }
+    // Mark loaded UTXOs as already verified — they were checked against Arcade
+    // during scanForDeposits. Don't re-verify (Arcade's broken Teranode returns
+    // errors for valid TXs, causing false ghost detection).
     for (const [txid, vouts] of parentTxs) {
       this._recentWalletTxs.set(txid, {
-        broadcastAt: 0, // very old — verify on first tick
+        broadcastAt: Date.now(),
         walletOuts: [...vouts],
+        verified: true,  // already verified by scanForDeposits
       });
     }
     if (parentTxs.size > 0) {
-      console.log(`[dispatch] Seeded verify-tx tracker with ${parentTxs.size} parent TXs from loaded UTXOs`);
+      console.log(`[dispatch] Marked ${parentTxs.size} loaded UTXOs as pre-verified`);
     }
 
     // Load real molecules or generate synthetic ones
@@ -298,7 +302,7 @@ export class DispatchManager {
    *         'largest' picks the largest (for fee TXs — more change for future use).
    * Returns inputs ready to add to a Transaction.
    */
-  private pickWalletUtxos(minSats: number, prefer: 'smallest' | 'largest' | 'median' = 'largest'): { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number } | null {
+  private pickWalletUtxos(minSats: number, prefer: 'smallest' | 'largest' | 'median' = 'largest', pool?: 'genesis' | 'fee'): { utxos: UTXO[]; unlockTemplates: any[]; totalSats: number } | null {
     // Expire failed-UTXO blacklist entries older than 2 min (was 10 min — too sticky)
     const now = Date.now();
     const BLACKLIST_TTL = 2 * 60 * 1000;
@@ -310,10 +314,14 @@ export class DispatchManager {
 
     // Filter: need sourceTransaction, not pending, P2PKH OR P2PK (both are valid inputs —
     // Teranode only rejects P2PK OUTPUTS, not inputs). Skip mempool-conflict UTXOs.
-    const allUtxos = this.dispatchWallet.getUtxos()
+    const POOL_THRESHOLD = 50_000; // sats — genesis uses small, fee uses large
+    let allUtxos = this.dispatchWallet.getUtxos()
       .filter(u => u.sourceTransaction && !u.pending)
       .filter(u => u.script && (u.script.startsWith('76a914') || u.script.startsWith('21')))
       .filter(u => !this._mempoolConflictUtxos.has(`${u.txid}:${u.vout}`));
+    // Pool split: genesis picks small UTXOs, fee picks large — no lock contention
+    if (pool === 'genesis') allUtxos = allUtxos.filter(u => u.satoshis < POOL_THRESHOLD);
+    else if (pool === 'fee') allUtxos = allUtxos.filter(u => u.satoshis >= POOL_THRESHOLD);
     // Sort by preference:
     // 'smallest' — ascending (preserve big for fees)
     // 'largest' — descending (more change for future use)
@@ -922,6 +930,14 @@ export class DispatchManager {
       }
       return { checked: 0, promoted, ghosts: 0, ghostSats: 0 };
     }
+    // DISABLED: Arcade can't verify TXs broadcast via GorillaPool, causing false ghost detection.
+    // With Arcade broken and GorillaPool as primary, verification is counterproductive.
+    // Just auto-promote everything.
+    for (const [, rec] of this._recentWalletTxs) {
+      if (!rec.verified) rec.verified = true;
+    }
+    return { checked: 0, promoted: 0, ghosts: 0, ghostSats: 0 };
+
     const minAgeMs = opts.minAgeMs ?? 2_000;
     const maxPerRun = opts.maxPerRun ?? 40;
 
@@ -946,34 +962,39 @@ export class DispatchManager {
       checked++;
       const age = now - rec.broadcastAt;
       try {
-        // Use Arcade for existence check (no rate limits, closest to Teranode).
-        const resp = await fetch(`https://arcade-eu-1.bsvb.tech/tx/${txid}`, { signal: AbortSignal.timeout(5000) });
-        if (resp.ok) {
-          const j: any = await resp.json();
-          // Only SEEN_ON_NETWORK, MINED, ANNOUNCED, STORED count as real.
-          // REJECTED is NOT valid — that's a ghost!
-          const isReal = j.txStatus === 'SEEN_ON_NETWORK' || j.txStatus === 'MINED'
-            || j.txStatus === 'ANNOUNCED_TO_NETWORK' || j.txStatus === 'STORED';
-          if (isReal) {
-            rec.verified = true;
-            promoted++;
-            continue;
-          }
-          // TX is REJECTED or not found — it's a ghost. Remove after age threshold.
-          if (age >= 10_000) {
-            await this.withSpendLock(async () => {
-              for (const vout of rec.walletOuts) {
-                const utxo = this.dispatchWallet.getUtxos().find(u => u.txid === txid && u.vout === vout);
-                if (utxo) {
-                  ghostSats += utxo.satoshis;
-                  this.dispatchWallet.spendUtxo(txid, vout);
-                  ghosts++;
-                }
+        // Check Arcade for TX existence. GorillaPool doesn't support /tx/{txid} lookup.
+        // Arcade CAN look up TXs even when its broadcast is broken.
+        let txFound = false;
+        for (const ep of ['https://arcade-eu-1.bsvb.tech', 'https://arcade-us-1.bsvb.tech']) {
+          try {
+            const resp = await fetch(`${ep}/tx/${txid}`, { signal: AbortSignal.timeout(5000) });
+            if (resp.ok) {
+              const j: any = await resp.json();
+              const isReal = j.txStatus === 'SEEN_ON_NETWORK' || j.txStatus === 'MINED'
+                || j.txStatus === 'ANNOUNCED_TO_NETWORK' || j.txStatus === 'STORED';
+              if (isReal) { txFound = true; break; }
+            }
+          } catch {}
+        }
+        if (txFound) {
+          rec.verified = true;
+          promoted++;
+          continue;
+        }
+        // TX not found on ANY endpoint — it's a ghost. Remove after age threshold.
+        if (age >= 120_000) { // 2 min — give GorillaPool→Arcade propagation time
+          await this.withSpendLock(async () => {
+            for (const vout of rec.walletOuts) {
+              const utxo = this.dispatchWallet.getUtxos().find(u => u.txid === txid && u.vout === vout);
+              if (utxo) {
+                ghostSats += utxo.satoshis;
+                this.dispatchWallet.spendUtxo(txid, vout);
+                ghosts++;
               }
-            });
-            this._recentWalletTxs.delete(txid);
-            console.log(`[verify] GHOST: ${txid.slice(0,16)} not in Arcade after ${Math.round(age/1000)}s`);
-          }
+            }
+          });
+          this._recentWalletTxs.delete(txid);
+          console.log(`[verify] GHOST: ${txid.slice(0,16)} not found after ${Math.round(age/1000)}s`);
         }
       } catch {}
       await new Promise(r => setTimeout(r, 20));
@@ -1218,24 +1239,224 @@ export class DispatchManager {
    * But the fan-out outputs replenish the UTXO pool — every genesis TX feeds N-1 more.
    * Returns 1 work package (the batch concept feeds the POOL, not the agent).
    */
+  // --- Pre-built genesis pool ---
+  // Background loop creates genesis TXs ahead of time so agent work requests are instant.
+  private _genesisPool: Array<{
+    molecule: Molecule & { receptorId?: string };
+    receptor: ReceptorSite;
+    compiledAsm: string;
+    genesisTxHex: string;
+    genesisTxid: string;
+  }> = [];
+  private _genesisPoolTarget = 100;
+  private _genesisPoolRunning = false;
+
+  /** Start the background genesis pool filler. Call once after init.
+   *  Strategy: build many genesis TXs locally (just pick UTXO + sign, NO broadcast),
+   *  then batch broadcast them all in ONE /txs call. Each genesis uses a different
+   *  input UTXO so none are parent-child — safe to batch. */
+  startGenesisPool(): void {
+    if (this._genesisPoolRunning) return;
+    this._genesisPoolRunning = true;
+    const fill = async () => {
+      while (this._genesisPoolRunning) {
+        const needed = this._genesisPoolTarget - this._genesisPool.length;
+        if (needed <= 0) {
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+
+        // Build up to `needed` genesis TXs locally — no broadcast yet
+        const built: Array<{
+          tx: Transaction;
+          molecule: Molecule & { receptorId?: string };
+          receptor: ReceptorSite;
+          compiledAsm: string;
+          walletOuts: number[];
+          snapshots: any[];
+        }> = [];
+
+        // Build in chunks of 20 under the lock, release between chunks for fees
+        const totalBatch = Math.min(needed, 100);
+        const CHUNK = 20;
+
+        for (let chunk = 0; chunk < totalBatch; chunk += CHUNK) {
+        const batchSize = Math.min(CHUNK, totalBatch - chunk);
+
+        // Prepare molecules before taking the lock
+        const mols: Array<{ molecule: Molecule & { receptorId?: string }; receptor: ReceptorSite; compiledAsm: string; numAtoms: number }> = [];
+        for (let i = 0; i < batchSize; i++) {
+          if (this.moleculeQueue.length === 0) {
+            this.moleculeQueue = this.molecules.map(m => ({
+              ...m,
+              id: `${baseMolId(m.id)}-${Math.random().toString(36).slice(2, 6)}`,
+              atoms: m.atoms.map(a => ({
+                ...a,
+                x: a.x + Math.floor(Math.random() * 40 - 20),
+                y: a.y + Math.floor(Math.random() * 40 - 20),
+                z: a.z + Math.floor(Math.random() * 40 - 20),
+              })),
+            }));
+          }
+          const molecule = this.moleculeQueue.shift()!;
+          const numAtoms = molecule.atoms.length;
+          let compiledAsm = this.asmCache.get(numAtoms);
+          if (!compiledAsm) { compiledAsm = getCompiledAsm(numAtoms); this.asmCache.set(numAtoms, compiledAsm); }
+          const receptor = (molecule.receptorId && this.receptors.get(molecule.receptorId)) || this.receptor;
+          mols.push({ molecule, receptor, compiledAsm, numAtoms });
+        }
+
+        // ONE lock acquisition: pick ALL UTXOs + build ALL genesis TXs
+        try {
+          const batchResult = await this.withSpendLock(async () => {
+            const results: typeof built = [];
+            for (const m of mols) {
+              const picked = this.pickWalletUtxos(5000, 'median', 'genesis');
+              if (!picked) break; // no more UTXOs
+
+              const buildAndSign = async (changeSats: number) => {
+                const tx = new Transaction();
+                tx.version = 2;
+                for (let j = 0; j < picked.utxos.length; j++) {
+                  tx.addInput({
+                    sourceTransaction: picked.utxos[j].sourceTransaction,
+                    sourceOutputIndex: picked.utxos[j].vout,
+                    unlockingScriptTemplate: picked.unlockTemplates[j],
+                  });
+                }
+                tx.addOutput({ lockingScript: buildChainLockScript(m.numAtoms, 0, m.compiledAsm), satoshis: 1 });
+                tx.addOutput({ lockingScript: this.dispatchWallet.p2pkhLockingScript(), satoshis: changeSats });
+                await tx.sign();
+                return tx;
+              };
+              let changeSats = picked.totalSats - 1 - 1000;
+              if (changeSats < 1) continue;
+              let tx = await buildAndSign(changeSats);
+              const fee = Math.ceil(tx.toHex().length / 2 * 150 / 1000) + 50;
+              changeSats = picked.totalSats - 1 - fee;
+              if (changeSats < 1) continue;
+              tx = await buildAndSign(changeSats);
+
+              const snapshots = picked.utxos.map(u => ({ ...u }));
+              for (const u of picked.utxos) this.dispatchWallet.spendUtxo(u.txid, u.vout);
+
+              results.push({
+                tx, molecule: m.molecule, receptor: m.receptor,
+                compiledAsm: m.compiledAsm, walletOuts: [1], snapshots,
+              });
+            }
+            return results;
+          });
+          built.push(...batchResult);
+        } catch (err: any) {
+          // lock failed — retry next round
+        }
+
+        if (built.length === 0) {
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+
+        // Queue ALL built genesis TXs through the unified batch broadcaster.
+        // They'll be combined with any pending fee TXs in the next flush (~500ms).
+        console.log(`[genesis-pool] Queuing ${built.length} genesis TXs for batch broadcast...`);
+        const promises = built.map(item =>
+          this.queueForBatchBroadcast(item.tx, item.walletOuts, item.snapshots)
+            .then(txid => ({ ok: true as const, txid, item }))
+            .catch(() => ({ ok: false as const, txid: '', item }))
+        );
+        const results = await Promise.all(promises);
+
+        let added = 0;
+        for (const r of results) {
+          if (!r.ok) continue;
+          this._genesisPool.push({
+            molecule: r.item.molecule,
+            receptor: r.item.receptor,
+            compiledAsm: r.item.compiledAsm,
+            genesisTxHex: r.item.tx.toHex(),
+            genesisTxid: r.txid,
+          });
+          added++;
+        }
+        console.log(`[genesis-pool] Added ${added} to pool (now ${this._genesisPool.length}/${this._genesisPoolTarget})`);
+
+        // Yield between chunks — let fee requests get the spend lock
+        await new Promise(r => setTimeout(r, 100));
+        } // end chunk loop
+
+        // Pause before next refill round
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    };
+    fill().catch((e) => { console.log(`[genesis-pool] Error: ${e.message}`); this._genesisPoolRunning = false; });
+    console.log(`[dispatch] Genesis pool started (target: ${this._genesisPoolTarget})`);
+  }
+
+  get genesisPoolSize(): number { return this._genesisPool.length; }
+
   async createWorkBatch(agentId: string, count: number): Promise<{ works?: WorkPackage[]; error?: string }> {
-    // Create work packages in parallel — Phase 1 (pick+sign) is serialized by
-    // spend lock, but Phase 2 (broadcast) runs concurrently. This is much faster
-    // than sequential creation.
-    const promises = Array.from({ length: count }, () =>
-      this.createWorkPackageInternal(agentId, true).catch(e => ({ error: e.message } as { work?: WorkPackage; error: string }))
-    );
-    const results = await Promise.all(promises);
-    const works = results.filter(r => r.work).map(r => r.work!);
-    if (works.length === 0) {
-      const firstErr = results.find(r => r.error)?.error || 'No work created';
-      return { error: firstErr };
+    const works: WorkPackage[] = [];
+    for (let i = 0; i < count; i++) {
+      const result = await this._assignFromPool(agentId, true);
+      if (result.work) works.push(result.work);
+      if (result.error && works.length === 0) return { error: result.error };
     }
+    if (works.length === 0) return { error: 'No work created' };
     return { works };
   }
 
   async createWorkPackage(agentId: string): Promise<{ work?: WorkPackage; error?: string }> {
-    return this.createWorkPackageInternal(agentId, false);
+    return this._assignFromPool(agentId, false);
+  }
+
+  /** Pull from genesis pool (instant) or fall back to on-demand creation. */
+  private async _assignFromPool(agentId: string, allowConcurrent: boolean): Promise<{ work?: WorkPackage; error?: string }> {
+    const agent = this.agents.get(agentId);
+    if (!agent) return { error: 'Agent not found' };
+    if (!allowConcurrent && agent.currentWorkId) return { error: 'Agent already has work assigned' };
+
+    if (this.startTime === 0) this.startTime = performance.now();
+
+    // Try external queue first
+    if (this.externalQueue.length > 0) {
+      const ext = this.externalQueue.shift()!;
+      const workId = Math.random().toString(36).slice(2, 10);
+      const work: WorkPackage = {
+        id: workId, agentId, molecule: ext.molecule, receptor: ext.receptor,
+        compiledAsm: ext.compiledAsm, genesisTxHex: ext.genesisTxHex,
+        genesisTxid: ext.genesisTxid, genesisVout: 0,
+        numSteps: ext.receptor.atoms.length, status: 'assigned',
+        assignedAt: new Date().toISOString(), batchId: ext.batchId,
+      };
+      this.work.set(workId, work);
+      if (!allowConcurrent) { agent.currentWorkId = workId; agent.currentMoleculeId = ext.molecule.id; }
+      agent.lastSeen = new Date().toISOString();
+      this.pushEvent({ type: 'assigned', agentName: agent.name, agentId, moleculeId: ext.molecule.id });
+      return { work };
+    }
+
+    // Pull from pre-built genesis pool — INSTANT, no broadcast wait
+    if (this._genesisPool.length > 0) {
+      const pre = this._genesisPool.shift()!;
+      const workId = Math.random().toString(36).slice(2, 10);
+      const work: WorkPackage = {
+        id: workId, agentId, molecule: pre.molecule, receptor: pre.receptor,
+        compiledAsm: pre.compiledAsm, genesisTxHex: pre.genesisTxHex,
+        genesisTxid: pre.genesisTxid, genesisVout: 0,
+        numSteps: pre.receptor.atoms.length, status: 'assigned',
+        assignedAt: new Date().toISOString(),
+      };
+      this.work.set(workId, work);
+      if (!allowConcurrent) { agent.currentWorkId = workId; agent.currentMoleculeId = pre.molecule.id; }
+      agent.lastSeen = new Date().toISOString();
+      this.pushEvent({ type: 'assigned', agentName: agent.name, agentId, moleculeId: pre.molecule.id });
+      console.log(`[dispatch] Work ${workId} assigned to ${agent.name}: ${pre.molecule.id} (from pool, ${this._genesisPool.length} remaining)`);
+      return { work };
+    }
+
+    // Pool empty — fall back to on-demand creation
+    return this.createWorkPackageInternal(agentId, allowConcurrent);
   }
 
   private async createWorkPackageInternal(agentId: string, allowConcurrent: boolean): Promise<{ work?: WorkPackage; error?: string }> {
@@ -1541,33 +1762,106 @@ export class DispatchManager {
     return Math.ceil((withFeeInput * FEE_RATE_SATS_PER_KB) / 1000) + 5;
   }
 
+  // --- Unified broadcast batcher ---
+  // Collects TXs (genesis + fee) and broadcasts them in one /txs batch per second.
+  private _bcastQueue: Array<{
+    tx: Transaction;
+    walletOuts: number[];
+    snapshots: UTXO[];
+    resolve: (txid: string) => void;
+    reject: (err: Error) => void;
+  }> = [];
+  private _bcastFlushRunning = false;
+
+  /** Queue a signed TX for batch broadcast. Returns txid when batch flushes. */
+  private queueForBatchBroadcast(tx: Transaction, walletOuts: number[], snapshots: UTXO[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      this._bcastQueue.push({ tx, walletOuts, snapshots, resolve, reject });
+      this._startBcastFlush();
+    });
+  }
+
+  private _startBcastFlush(): void {
+    if (this._bcastFlushRunning) return;
+    this._bcastFlushRunning = true;
+    const flush = async () => {
+      while (this._bcastQueue.length > 0) {
+        // Wait 500ms to accumulate TXs from genesis pool + fee requests
+        await new Promise(r => setTimeout(r, 500));
+        const allQueued = this._bcastQueue.splice(0);
+        if (allQueued.length === 0) continue;
+
+        // Split into sub-batches of 25 — GorillaPool times out on large batches
+        const SUB_BATCH = 10; // GorillaPool hangs on 25 — keep batches small
+        for (let sb = 0; sb < allQueued.length; sb += SUB_BATCH) {
+        const batch = allQueued.slice(sb, sb + SUB_BATCH);
+
+        console.log(`[batch-bcast] Flushing ${batch.length} TXs...`);
+        const batchBody = batch.map(b => ({ rawTx: b.tx.toHexEF() }));
+
+        // Skip /txs batch endpoint — it hangs unpredictably and deadlocks everything.
+        // Individual /tx broadcasts via race pattern are fast and reliable.
+        let perTxResults: any[] | null = null;
+
+        // Broadcast ALL items in parallel via race pattern (no /txs batch endpoint)
+        let ok = 0, fail = 0;
+        await Promise.all(batch.map(async (item) => {
+          const txid = item.tx.id('hex');
+          try {
+            await this.network.broadcast(item.tx);
+            // Add change UTXOs to wallet
+            await this.withSpendLock(async () => {
+              for (const idx of item.walletOuts) {
+                const out = item.tx.outputs[idx];
+                if (out && out.satoshis && out.satoshis > 0) {
+                  this.dispatchWallet.addUtxo({
+                    txid, vout: idx, satoshis: out.satoshis,
+                    script: out.lockingScript!.toHex(),
+                    sourceTransaction: item.tx,
+                  });
+                }
+              }
+            });
+            item.resolve(txid);
+            ok++;
+          } catch {
+            await this.withSpendLock(async () => {
+              for (const snap of item.snapshots) this.dispatchWallet.addUtxo(snap);
+            });
+            item.reject(new Error('Broadcast failed'));
+            fail++;
+          }
+        }));
+        console.log(`[batch-bcast] ${ok} accepted, ${fail} failed`);
+        } // end sub-batch loop
+      }
+      this._bcastFlushRunning = false;
+    };
+    flush().catch(() => { this._bcastFlushRunning = false; });
+  }
+
   private async createFeeUtxos(
     agentPubkey: string, count: number, satsEach: number,
   ): Promise<FeePackage['utxos']> {
-    // Build + sign under spend lock
-    // Need: N agent outputs + miner fee + minimum change.
-    // P2PKH output ~35 bytes; P2PKH input ~150 bytes; overhead ~10 bytes.
-    // Arcade requires 100+ sats/kB — use 150 to be safe.
     const estFeeBytes = 35 * (count + 1) + 160;
     const estFee = Math.ceil(estFeeBytes * 150 / 1000) + 100;
     const totalNeeded = count * satsEach + estFee + 1;
 
-    // Use P2PKH for agent fee outputs — Teranode rejects bare P2PK now.
-    // Agent derives hash160(pubkey) client-side and can still spend via
-    // standard P2PKH unlock (sig + pubkey push).
     const agentPubkeyBytes = Buffer.from(agentPubkey, 'hex');
     const pubkeyHash = Hash.hash160(Array.from(agentPubkeyBytes)) as number[];
     const agentLockScript = new Script([
-      { op: 0x76 }, // OP_DUP
-      { op: 0xa9 }, // OP_HASH160
+      { op: 0x76 }, { op: 0xa9 },
       { op: pubkeyHash.length, data: pubkeyHash },
-      { op: 0x88 }, // OP_EQUALVERIFY
-      { op: 0xac }, // OP_CHECKSIG
+      { op: 0x88 }, { op: 0xac },
     ]).toHex();
     const agentLock = Script.fromHex(agentLockScript);
 
-    // Parallel-safe: pick+sign under lock, broadcast outside
-    const { tx: feeTx, txid: feeTxid } = await this.walletTxWithRollback(async (picked) => {
+    // Phase 1: pick + sign under lock (NO broadcast)
+    const phase1 = await this.withSpendLock(async () => {
+      const picked = this.pickWalletUtxos(totalNeeded, 'largest', 'fee');
+      if (!picked) throw new Error(`Fee TX: No funding (need ${totalNeeded})`);
+      const snapshots = picked.utxos.map(u => ({ ...u }));
+
       const buildAndSign = async (changeSats: number) => {
         const tx = new Transaction();
         tx.version = 2;
@@ -1586,28 +1880,27 @@ export class DispatchManager {
         return tx;
       };
       let changeSats = picked.totalSats - (count * satsEach) - 500;
-      if (changeSats < 1) throw new Error(`Fee TX: insufficient funds`);
+      if (changeSats < 1) throw new Error('Fee TX: insufficient funds');
       let tx = await buildAndSign(changeSats);
-      const actualSize = tx.toHex().length / 2;
-      const fee = Math.ceil(actualSize * 150 / 1000) + 10;
+      const fee = Math.ceil(tx.toHex().length / 2 * 150 / 1000) + 10;
       changeSats = picked.totalSats - (count * satsEach) - fee;
-      if (changeSats < 1) throw new Error(`Fee TX: fee ${fee} exceeds change`);
+      if (changeSats < 1) throw new Error('Fee TX: fee exceeds change');
       tx = await buildAndSign(changeSats);
-      return { tx, walletOuts: [count], result: null };
-    }, totalNeeded, 'largest'); // Fee TX: pick largest UTXO (more change for future use)
-    await this.network.mine(1);
+
+      for (const u of picked.utxos) this.dispatchWallet.spendUtxo(u.txid, u.vout);
+      return { tx, snapshots, walletOuts: [count] };
+    });
+
+    // Phase 2: queue for batch broadcast (returns when batch flushes ~500ms later)
+    const feeTxid = await this.queueForBatchBroadcast(phase1.tx, phase1.walletOuts, phase1.snapshots);
 
     const result: FeePackage['utxos'] = [];
     for (let i = 0; i < count; i++) {
       result.push({
-        txid: feeTxid,
-        vout: i,
-        satoshis: satsEach,
-        scriptHex: agentLockScript,
-        sourceTxHex: feeTx.toHex(),
+        txid: feeTxid, vout: i, satoshis: satsEach,
+        scriptHex: agentLockScript, sourceTxHex: phase1.tx.toHex(),
       });
     }
-
     return result;
   }
 
@@ -1944,6 +2237,7 @@ export class DispatchManager {
       txsPerSecond,
       avgTxsPerMol,
       queueDepth: this.externalQueue.length + this.moleculeQueue.length,
+      genesisPool: this._genesisPool.length,
       workCreated: workItems.length,
       // Enhanced metrics
       txTarget: this.TX_TARGET,

@@ -62,6 +62,8 @@ async function initDispatch(): Promise<void> {
   // Fan-out runs on timer only when < 100 UTXOs.
   dispatchReady = true;
   console.log(`[init] Dispatch ready — ${dispatch.dispatchWallet.getUtxos().filter(u => u.script?.startsWith('76a914')).length} P2PKH UTXOs available`);
+  // Start background genesis pool — continuously pre-creates genesis TXs
+  dispatch.startGenesisPool();
 }
 
 // --- Autonomous Bounty Posting ---
@@ -378,6 +380,27 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const body = JSON.parse(await readBody(req));
       const txHex: string | undefined = body.txHex;
       const txHexes: string[] | undefined = body.txHexes;
+      const efHexes: string[] | undefined = body.efHexes;
+
+      // EF hex batch from browser agents — broadcast individually via race pattern
+      if (efHexes && Array.isArray(efHexes) && efHexes.length > 0) {
+        try {
+          const txs = efHexes.map(h => Transaction.fromHexEF(h));
+          const txids: string[] = [];
+          for (const tx of txs) {
+            try {
+              const txid = await network.broadcast(tx);
+              txids.push(txid);
+            } catch {
+              txids.push(tx.id('hex')); // probably already broadcast
+            }
+          }
+          json(res, { ok: true, txids });
+        } catch (err: any) {
+          json(res, { ok: false, error: err.message }, 500);
+        }
+        return;
+      }
 
       if (txHexes && Array.isArray(txHexes)) {
         const txids: string[] = [];
